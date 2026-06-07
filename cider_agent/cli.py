@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from typing import Any
 
-from .app import get_service
+import httpx
+
+from .a2a import _message
+from .app import get_service, get_settings
 from .errors import CiderAgentError, TextRequestExecutionError
 
 
@@ -17,6 +21,178 @@ def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
         return
     result = payload.get("result", payload)
     print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _call_local_a2a(message: dict[str, Any]) -> dict[str, Any]:
+    settings = get_settings()
+    endpoint = f"{settings.public_base_url}/a2a"
+    request_id = str(uuid.uuid4())
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "message/send",
+        "params": {
+            "message": message,
+        },
+    }
+    try:
+        with httpx.Client(timeout=settings.request_timeout_seconds, verify=settings.verify_tls) as client:
+            response = client.post(endpoint, json=payload)
+    except httpx.HTTPError as exc:
+        raise ConnectionError(str(exc)) from exc
+    response.raise_for_status()
+    body = response.json()
+    if "error" in body:
+        error = body["error"]
+        message_text = str(error.get("message", "Unknown server error."))
+        data = error.get("data")
+        if isinstance(data, dict):
+            raise TextRequestExecutionError(message_text, data)
+        raise CiderAgentError(message_text)
+    result = body.get("result")
+    if not isinstance(result, dict):
+        raise CiderAgentError("Local A2A server returned an invalid task payload.")
+    return result
+
+
+def _extract_task_payload(task: dict[str, Any]) -> dict[str, Any]:
+    artifacts = task.get("artifacts", [])
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            parts = artifact.get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if isinstance(part, dict) and part.get("kind") == "data" and isinstance(part.get("data"), dict):
+                    return dict(part["data"])
+    raise CiderAgentError("Local A2A server task did not include a data artifact.")
+
+
+def _task_to_cli_payload(task: dict[str, Any], *, original_text: str | None = None) -> dict[str, Any]:
+    payload = _extract_task_payload(task)
+    metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+    action = metadata.get("action")
+    if original_text is not None:
+        response: dict[str, Any] = {
+            "status": "ok",
+            "input": original_text,
+            "resolver": metadata.get("resolver"),
+            "resolved_action": metadata.get("resolved_action", {"action": action} if action else {}),
+            "execution": {
+                "action": action,
+                "result": payload,
+            },
+        }
+        if "reasoning" in metadata:
+            response["reasoning"] = metadata["reasoning"]
+        if "resolver_raw_content" in metadata:
+            response["resolver_raw_content"] = metadata["resolver_raw_content"]
+        if "resolver_raw_action" in metadata:
+            response["resolver_raw_action"] = metadata["resolver_raw_action"]
+        return response
+    return payload
+
+
+def _build_action_request(args: argparse.Namespace) -> tuple[str, dict[str, Any]] | None:
+    if args.command == "status":
+        return "status", {}
+    if args.command == "now-playing":
+        return "get_now_playing", {}
+    if args.command == "play":
+        return "play", {}
+    if args.command == "pause":
+        return "pause", {}
+    if args.command == "playpause":
+        return "playpause", {}
+    if args.command == "stop":
+        return "stop", {}
+    if args.command == "next":
+        return "next_track", {}
+    if args.command == "previous":
+        return "previous_track", {}
+    if args.command == "seek":
+        return "seek", {"position_seconds": args.position_seconds}
+    if args.command == "volume":
+        if args.volume_command == "get":
+            return "get_volume", {}
+        return "set_volume", {"volume": args.volume}
+    if args.command == "queue":
+        if args.queue_command == "show":
+            return "get_queue", {}
+        if args.queue_command == "clear":
+            return "clear_queue", {}
+        if args.queue_command == "remove":
+            return "remove_queue_item", {"index": args.index}
+        return "move_queue_item", {"from_index": args.from_index, "to_index": args.to_index}
+    if args.command == "search":
+        if args.search_command == "default":
+            return "search", {"query": args.query, "limit": args.limit, "storefront": args.storefront}
+        if args.search_command == "library":
+            return "search_library", {"query": args.query, "limit": args.limit}
+        return "search_catalog", {"query": args.query, "limit": args.limit, "storefront": args.storefront}
+    if args.command == "session":
+        if args.session_command == "status":
+            return "session_status", {}
+        if args.session_command == "stop":
+            return "stop_session", {}
+        return "refill_session", {}
+    if args.command == "playlist":
+        if args.playlist_command == "list":
+            return "list_library_playlists", {}
+        if args.playlist_command == "tracks":
+            return "get_library_playlist_tracks", {"playlist_id": args.playlist_id}
+        if args.playlist_command == "create":
+            return "create_playlist", {
+                "name": args.name,
+                "description": args.description,
+                "track_refs": _parse_track_refs(args.track_ref) if args.track_ref else None,
+            }
+        return "add_playlist_tracks", {
+            "playlist_id": args.playlist_id,
+            "track_refs": _parse_track_refs(args.track_ref),
+        }
+    if args.command == "preferences":
+        if args.preferences_command == "list":
+            return "list_preferences", {}
+        if args.preferences_command == "remember":
+            return "remember_preference", {
+                "kind": args.kind,
+                "value": args.value,
+                "category": args.category,
+                "weight": args.weight,
+                "note": args.note,
+            }
+        return "forget_preference", {"preference_id": args.preference_id}
+    if args.command == "recommend":
+        if args.play:
+            return "play_recommendation", {"query": args.query}
+        return "recommend", {"query": args.query, "limit": args.limit}
+    return None
+
+
+def _run_via_local_server(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command == "ask":
+        task = _call_local_a2a(
+            _message(
+                "user",
+                [{"kind": "text", "text": args.text}],
+            )
+        )
+        return _task_to_cli_payload(task, original_text=args.text)
+
+    action_request = _build_action_request(args)
+    if action_request is None:
+        raise CiderAgentError(f"Unsupported CLI command for local server mode: {args.command}")
+    action, parameters = action_request
+    task = _call_local_a2a(
+        _message(
+            "user",
+            [{"kind": "data", "data": {"action": action, "parameters": parameters}}],
+        )
+    )
+    return _task_to_cli_payload(task)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -129,13 +305,10 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     try:
-        service = get_service()
-
         if args.command == "serve":
             import uvicorn
 
             from .a2a import create_a2a_app
-            from .app import get_settings
 
             settings = get_settings()
             uvicorn.run(
@@ -146,90 +319,94 @@ def main() -> None:
             )
             return
 
-        if args.command == "status":
-            payload = service.status()
-        elif args.command == "now-playing":
-            payload = service.get_now_playing()
-        elif args.command == "play":
-            payload = service.play()
-        elif args.command == "pause":
-            payload = service.pause()
-        elif args.command == "playpause":
-            payload = service.playpause()
-        elif args.command == "stop":
-            payload = service.stop()
-        elif args.command == "next":
-            payload = service.next_track()
-        elif args.command == "previous":
-            payload = service.previous_track()
-        elif args.command == "seek":
-            payload = service.seek(args.position_seconds)
-        elif args.command == "volume":
-            if args.volume_command == "get":
-                payload = service.get_volume()
-            else:
-                payload = service.set_volume(args.volume)
-        elif args.command == "queue":
-            if args.queue_command == "show":
-                payload = service.get_queue()
-            elif args.queue_command == "clear":
-                payload = service.clear_queue()
-            elif args.queue_command == "remove":
-                payload = service.remove_queue_item(args.index)
-            else:
-                payload = service.move_queue_item(args.from_index, args.to_index)
-        elif args.command == "search":
-            if args.search_command == "default":
-                payload = service.search(args.query, limit=args.limit, storefront=args.storefront)
-            elif args.search_command == "library":
-                payload = service.search_library(args.query, limit=args.limit)
-            else:
-                payload = service.search_catalog(args.query, limit=args.limit, storefront=args.storefront)
-        elif args.command == "ask":
-            payload = service.handle_text_request(args.text)
-        elif args.command == "session":
-            if args.session_command == "status":
-                payload = service.session_status()
-            elif args.session_command == "stop":
-                payload = service.stop_session()
-            else:
-                payload = service.refill_active_session()
-        elif args.command == "playlist":
-            if args.playlist_command == "list":
-                payload = service.list_library_playlists()
-            elif args.playlist_command == "tracks":
-                payload = service.get_library_playlist_tracks(args.playlist_id)
-            elif args.playlist_command == "create":
-                payload = service.create_playlist(
-                    name=args.name,
-                    description=args.description,
-                    track_refs=_parse_track_refs(args.track_ref) if args.track_ref else None,
-                )
-            else:
-                payload = service.add_playlist_tracks(
-                    args.playlist_id,
-                    track_refs=_parse_track_refs(args.track_ref),
-                )
-        elif args.command == "preferences":
-            if args.preferences_command == "list":
-                payload = service.list_preferences()
-            elif args.preferences_command == "remember":
-                payload = service.remember_preference(
-                    kind=args.kind,
-                    value=args.value,
-                    category=args.category,
-                    weight=args.weight,
-                    note=args.note,
-                )
-            else:
-                payload = service.forget_preference(args.preference_id)
-        elif args.command == "recommend":
-            if args.play:
-                payload = service.play_recommendation(query=args.query)
-            else:
-                payload = service.recommend(query=args.query, limit=args.limit)
-        else:  # pragma: no cover - argparse enforces commands
-            raise RuntimeError(f"Unhandled command: {args.command}")
+        try:
+            payload = _run_via_local_server(args)
+        except ConnectionError:
+            service = get_service()
+            if args.command == "status":
+                payload = service.status()
+            elif args.command == "now-playing":
+                payload = service.get_now_playing()
+            elif args.command == "play":
+                payload = service.play()
+            elif args.command == "pause":
+                payload = service.pause()
+            elif args.command == "playpause":
+                payload = service.playpause()
+            elif args.command == "stop":
+                payload = service.stop()
+            elif args.command == "next":
+                payload = service.next_track()
+            elif args.command == "previous":
+                payload = service.previous_track()
+            elif args.command == "seek":
+                payload = service.seek(args.position_seconds)
+            elif args.command == "volume":
+                if args.volume_command == "get":
+                    payload = service.get_volume()
+                else:
+                    payload = service.set_volume(args.volume)
+            elif args.command == "queue":
+                if args.queue_command == "show":
+                    payload = service.get_queue()
+                elif args.queue_command == "clear":
+                    payload = service.clear_queue()
+                elif args.queue_command == "remove":
+                    payload = service.remove_queue_item(args.index)
+                else:
+                    payload = service.move_queue_item(args.from_index, args.to_index)
+            elif args.command == "search":
+                if args.search_command == "default":
+                    payload = service.search(args.query, limit=args.limit, storefront=args.storefront)
+                elif args.search_command == "library":
+                    payload = service.search_library(args.query, limit=args.limit)
+                else:
+                    payload = service.search_catalog(args.query, limit=args.limit, storefront=args.storefront)
+            elif args.command == "ask":
+                payload = service.handle_text_request(args.text)
+            elif args.command == "session":
+                if args.session_command == "status":
+                    payload = service.session_status()
+                elif args.session_command == "stop":
+                    payload = service.stop_session()
+                else:
+                    payload = service.refill_active_session()
+            elif args.command == "playlist":
+                if args.playlist_command == "list":
+                    payload = service.list_library_playlists()
+                elif args.playlist_command == "tracks":
+                    payload = service.get_library_playlist_tracks(args.playlist_id)
+                elif args.playlist_command == "create":
+                    payload = service.create_playlist(
+                        name=args.name,
+                        description=args.description,
+                        track_refs=_parse_track_refs(args.track_ref) if args.track_ref else None,
+                    )
+                else:
+                    payload = service.add_playlist_tracks(
+                        args.playlist_id,
+                        track_refs=_parse_track_refs(args.track_ref),
+                    )
+            elif args.command == "preferences":
+                if args.preferences_command == "list":
+                    payload = service.list_preferences()
+                elif args.preferences_command == "remember":
+                    payload = service.remember_preference(
+                        kind=args.kind,
+                        value=args.value,
+                        category=args.category,
+                        weight=args.weight,
+                        note=args.note,
+                    )
+                else:
+                    payload = service.forget_preference(args.preference_id)
+            elif args.command == "recommend":
+                if args.play:
+                    payload = service.play_recommendation(query=args.query)
+                else:
+                    payload = service.recommend(query=args.query, limit=args.limit)
+            else:  # pragma: no cover - argparse enforces commands
+                raise RuntimeError(f"Unhandled command: {args.command}")
     except TextRequestExecutionError as exc:
         print(json.dumps(exc.payload, indent=2, sort_keys=True), file=sys.stderr)
         raise SystemExit(1) from None

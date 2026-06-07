@@ -185,9 +185,8 @@ class DeterministicRecommender:
 class CiderAgentService:
     """High-level operations for the Cider agent."""
 
-    SESSION_QUEUE_TARGET_SIZE = 4
-    SESSION_QUEUE_REFILL_THRESHOLD = 2
-    SESSION_REFILL_INTERVAL_SECONDS = 15.0
+    SESSION_REFILL_INTERVAL_SECONDS = 5.0
+    SESSION_ADVANCE_COOLDOWN_SECONDS = 5.0
 
     def __init__(
         self,
@@ -206,6 +205,9 @@ class CiderAgentService:
         self._session_worker_thread: threading.Thread | None = None
         self._session_worker_stop = threading.Event()
         self._session_worker_lock = threading.Lock()
+        self._session_runtime_lock = threading.Lock()
+        self._session_runtime: dict[int, dict[str, Any]] = {}
+        self._session_advance_lock = threading.Lock()
 
     def close(self) -> None:
         self.stop_background_session_worker()
@@ -216,6 +218,9 @@ class CiderAgentService:
 
     def default_search_source(self) -> str:
         return self._settings.default_search_source
+
+    def response_detail(self) -> str:
+        return self._settings.response_detail
 
     def session_recent_tracks_limit(self) -> int:
         return self._settings.session_recent_tracks_limit
@@ -244,13 +249,43 @@ class CiderAgentService:
             thread.join(timeout=1.0)
 
     def status(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": "ok",
             "source": "cider-agent",
             "config": self._settings.sanitized(),
             "playback": self.playback_snapshot(),
             "preferences_count": len(self._preferences.list_preferences()),
         }
+        if self.response_detail() == "compact":
+            queue = self.get_queue()
+            session = self._preferences.get_active_session()
+            return {
+                "status": "ok",
+                "source": "cider-agent",
+                "playback": {
+                    "is_playing": payload["playback"].get("is_playing"),
+                    "track": self._compact_track(payload["playback"].get("track", {})),
+                    "volume": payload["playback"].get("volume"),
+                    "queue_length": queue.get("count", 0),
+                },
+                "queue": {
+                    "count": queue.get("count", 0),
+                    "tracks": [
+                        self._compact_track(item["track"])
+                        for item in queue.get("items", [])[:5]
+                        if isinstance(item, dict) and isinstance(item.get("track"), dict)
+                    ],
+                },
+                "session": {
+                    "id": session.get("id"),
+                    "is_active": session.get("is_active"),
+                    "mode": session.get("mode"),
+                }
+                if isinstance(session, dict)
+                else None,
+                "preferences_count": payload["preferences_count"],
+            }
+        return payload
 
     def get_now_playing(self) -> dict[str, Any]:
         payload = self._rpc.playback_get("/now-playing")
@@ -297,19 +332,37 @@ class CiderAgentService:
         return {"status": "ok", "is_playing": self._extract_is_playing(self._rpc.playback_get("/is-playing"))}
 
     def play(self) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is not None:
+            self._set_session_runtime(session["id"], suspended=False)
+            snapshot = self.playback_snapshot()
+            if snapshot.get("is_playing"):
+                return {"status": "ok", "result": self._rpc.playback_post("/play")}
+            if _clean_id(snapshot.get("track", {}).get("track_id")):
+                return {"status": "ok", "result": self._rpc.playback_post("/play")}
+            return self._play_session_track(session, selection_strategy="adaptive-session-resume")
         return {"status": "ok", "result": self._rpc.playback_post("/play")}
 
     def pause(self) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is not None:
+            self._set_session_runtime(session["id"], suspended=True)
         return {"status": "ok", "result": self._rpc.playback_post("/pause")}
 
     def playpause(self) -> dict[str, Any]:
         return {"status": "ok", "result": self._rpc.playback_post("/playpause")}
 
     def stop(self) -> dict[str, Any]:
-        self._preferences.stop_active_session()
+        stopped = self._preferences.stop_active_session()
+        if stopped is not None:
+            self._clear_session_runtime(stopped["id"])
         return {"status": "ok", "result": self._rpc.playback_post("/stop")}
 
     def next_track(self) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is not None:
+            self._set_session_runtime(session["id"], suspended=False)
+            return self._play_session_track(session, selection_strategy="adaptive-session-skip")
         return {"status": "ok", "result": self._rpc.playback_post("/next")}
 
     def previous_track(self) -> dict[str, Any]:
@@ -645,13 +698,18 @@ class CiderAgentService:
             "playback": play_result,
         }
 
-    def session_status(self, *, include_recent_tracks: bool = True) -> dict[str, Any]:
+    def session_status(self, *, include_recent_tracks: bool = True, compact: bool | None = None) -> dict[str, Any]:
         session = self._preferences.get_active_session()
         if session is None:
-            return {"status": "ok", "session": None}
+            payload = {"status": "ok", "session": None}
+            return self._compact_output(payload) if compact is not False and self.response_detail() == "compact" else payload
         payload = {"status": "ok", "session": session}
         if include_recent_tracks:
             payload["recent_tracks"] = self.recent_session_tracks(limit=self.session_recent_tracks_limit())
+        if compact is False:
+            return payload
+        if compact is True or self.response_detail() == "compact":
+            return self._compact_output(payload)
         return payload
 
     def recent_session_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
@@ -662,17 +720,17 @@ class CiderAgentService:
 
     def stop_session(self) -> dict[str, Any]:
         stopped = self._preferences.stop_active_session()
+        if stopped is not None:
+            self._clear_session_runtime(stopped["id"])
         return {"status": "ok", "stopped": stopped is not None, "session": stopped}
 
     def play_session(self, request: str) -> dict[str, Any]:
         if not request.strip():
             raise CiderValidationError("request cannot be empty.")
         session = self._preferences.start_session(request_text=request.strip())
-        try:
-            self.clear_queue()
-        except CiderAgentError:
-            LOGGER.debug("Could not clear queue before starting session.", exc_info=True)
-        result = self._refill_session(session, interrupt_playback=True)
+        self._clear_all_session_runtime()
+        self._set_session_runtime(session["id"], suspended=False)
+        result = self._play_session_track(session, selection_strategy="adaptive-session-start")
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -687,11 +745,8 @@ class CiderAgentService:
         if session is None:
             raise CiderValidationError("No active session is running.")
         session = self._preferences.add_session_steering(session["id"], request.strip())
-        try:
-            self.clear_queue()
-        except CiderAgentError:
-            LOGGER.debug("Could not clear queue while steering session.", exc_info=True)
-        result = self._refill_session(session, interrupt_playback=False)
+        self._set_session_runtime(session["id"], suspended=False)
+        result = self._play_session_track(session, selection_strategy="adaptive-session-steer")
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -703,7 +758,8 @@ class CiderAgentService:
         session = self._preferences.get_active_session()
         if session is None:
             raise CiderValidationError("No active session is running.")
-        result = self._refill_session(session, interrupt_playback=False)
+        self._set_session_runtime(session["id"], suspended=False)
+        result = self._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -777,10 +833,7 @@ class CiderAgentService:
             "status": "ok",
             "input": text,
             "resolver": resolved.resolver,
-            "resolved_action": {
-                "action": resolved.action,
-                "parameters": resolved.parameters,
-            },
+            "resolved_action": self._compact_resolved_action(resolved.action, resolved.parameters),
         }
         if resolved.reasoning:
             response["reasoning"] = resolved.reasoning
@@ -926,11 +979,13 @@ class CiderAgentService:
             result = actions[action]()
         except (KeyError, TypeError, ValueError) as exc:
             raise CiderValidationError(f"Invalid parameters for action {action}: {exc}") from exc
-        return {
+        payload = {
             "action": action,
-            "result": result,
-            "request_id": str(uuid.uuid4()),
+            "result": self._finalize_output(result),
         }
+        if self.response_detail() == "debug":
+            payload["request_id"] = str(uuid.uuid4())
+        return payload
 
     def _session_worker_loop(self) -> None:
         while not self._session_worker_stop.wait(self.SESSION_REFILL_INTERVAL_SECONDS):
@@ -938,58 +993,55 @@ class CiderAgentService:
                 session = self._preferences.get_active_session()
                 if session is None:
                     continue
-                self._record_current_track_for_session(session)
-                queue = self.get_queue()
-                if queue["count"] < self.SESSION_QUEUE_REFILL_THRESHOLD:
-                    self._refill_session(session, interrupt_playback=False)
+                playback = self.playback_snapshot()
+                self._record_current_track_for_session(session, playback=playback)
+                if self._should_advance_session(session, playback):
+                    self._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
             except Exception:
                 LOGGER.exception("Adaptive session worker failed during refill loop.")
 
-    def _refill_session(self, session: dict[str, Any], *, interrupt_playback: bool) -> dict[str, Any]:
-        self._record_current_track_for_session(session)
-        queue = self.get_queue()
-        needed = self.SESSION_QUEUE_TARGET_SIZE if interrupt_playback else max(0, self.SESSION_QUEUE_TARGET_SIZE - queue["count"])
-        if needed <= 0:
-            self._preferences.touch_session_refill(session["id"])
-            return {
-                "status": "ok",
-                "selection_strategy": "session-queue-unchanged",
-                "enqueued_count": 0,
-                "tracks": [],
-            }
-
-        plan = self._plan_session_tracks(session, count=max(needed, 1))
-        tracks = self._collect_session_tracks(plan, limit=max(needed, 1))
-        if not tracks:
-            raise CiderValidationError("No playable candidate match could be resolved.")
-
-        selected_tracks = tracks[: max(needed, 1)]
-        playback: dict[str, Any] | None = None
-        enqueued: list[dict[str, Any]] = []
-        if interrupt_playback:
-            lead_track = selected_tracks[0]
-            playback = self._play_flattened_track(lead_track, is_library_default=False)
-            self._preferences.add_session_track(session["id"], lead_track)
-            for track in selected_tracks[1:]:
-                self._enqueue_flattened_track(track)
-                enqueued.append(track)
-        else:
-            for track in selected_tracks:
-                self._enqueue_flattened_track(track)
-                enqueued.append(track)
-        self._preferences.touch_session_refill(session["id"])
-        return {
-            "status": "ok",
-            "selection_strategy": "adaptive-session-refill",
-            "playback": playback,
-            "enqueued_count": len(enqueued),
-            "tracks": selected_tracks,
-            "plan": {
-                "candidate_tracks": plan.candidate_tracks,
-                "candidate_artists": plan.candidate_artists,
-                "candidate_queries": plan.candidate_queries,
-            },
-        }
+    def _play_session_track(self, session: dict[str, Any], *, selection_strategy: str) -> dict[str, Any]:
+        with self._session_advance_lock:
+            now = time.monotonic()
+            self._set_session_runtime(
+                session["id"],
+                suspended=False,
+                advance_in_progress=True,
+                last_advance_at=now,
+            )
+            try:
+                playback = self.playback_snapshot()
+                self._record_current_track_for_session(session, playback=playback)
+                plan = self._plan_session_tracks(session, count=3)
+                tracks = self._collect_session_tracks(plan, limit=3)
+                if not tracks:
+                    raise CiderValidationError("No playable candidate match could be resolved.")
+                lead_track = tracks[0]
+                playback_result = self._play_flattened_track(lead_track, is_library_default=False)
+                self._preferences.add_session_track(session["id"], lead_track)
+                self._preferences.touch_session_refill(session["id"])
+                self._set_session_runtime(
+                    session["id"],
+                    suspended=False,
+                    advance_in_progress=False,
+                    last_advance_at=time.monotonic(),
+                    last_selected_track_id=_clean_id(lead_track.get("play_params", {}).get("id")),
+                )
+                return {
+                    "status": "ok",
+                    "selection_strategy": selection_strategy,
+                    "playback": playback_result,
+                    "enqueued_count": 0,
+                    "tracks": [lead_track],
+                    "plan": {
+                        "candidate_tracks": plan.candidate_tracks,
+                        "candidate_artists": plan.candidate_artists,
+                        "candidate_queries": plan.candidate_queries,
+                    },
+                }
+            except Exception:
+                self._set_session_runtime(session["id"], advance_in_progress=False)
+                raise
 
     def _plan_session_tracks(self, session: dict[str, Any], *, count: int) -> SessionPlan:
         planner = getattr(self._resolver, "plan_session", None)
@@ -1070,16 +1122,11 @@ class CiderAgentService:
             track_id = _clean_id(track.get("track_id"))
             if track_id:
                 excluded.add(track_id)
-        queue = self.get_queue()
-        for item in queue.get("items", []):
-            queue_track_id = _clean_id(item.get("track", {}).get("play_params", {}).get("id"))
-            if queue_track_id:
-                excluded.add(queue_track_id)
         return excluded
 
-    def _record_current_track_for_session(self, session: dict[str, Any]) -> None:
-        current = self.get_now_playing().get("track", {})
-        current_id = _clean_id(current.get("play_params", {}).get("id"))
+    def _record_current_track_for_session(self, session: dict[str, Any], *, playback: dict[str, Any] | None = None) -> None:
+        current = (playback or self.playback_snapshot()).get("track", {})
+        current_id = _clean_id(current.get("track_id"))
         if not current_id:
             return
         recent = self._preferences.list_session_tracks(session["id"], limit=1)
@@ -1092,9 +1139,41 @@ class CiderAgentService:
                 "title": current.get("title"),
                 "artist": current.get("artist"),
                 "album": current.get("album"),
-                "href": current.get("href"),
+                "href": None,
             },
         )
+
+    def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
+        runtime = self._get_session_runtime(session["id"])
+        if runtime.get("suspended"):
+            return False
+        if runtime.get("advance_in_progress"):
+            return False
+        if playback.get("is_playing"):
+            return False
+        now = time.monotonic()
+        last_advance_at = runtime.get("last_advance_at", 0.0)
+        if now - float(last_advance_at) < self.SESSION_ADVANCE_COOLDOWN_SECONDS:
+            return False
+        return True
+
+    def _get_session_runtime(self, session_id: int) -> dict[str, Any]:
+        with self._session_runtime_lock:
+            return dict(self._session_runtime.get(session_id, {}))
+
+    def _set_session_runtime(self, session_id: int, **updates: Any) -> None:
+        with self._session_runtime_lock:
+            runtime = dict(self._session_runtime.get(session_id, {}))
+            runtime.update(updates)
+            self._session_runtime[session_id] = runtime
+
+    def _clear_session_runtime(self, session_id: int) -> None:
+        with self._session_runtime_lock:
+            self._session_runtime.pop(session_id, None)
+
+    def _clear_all_session_runtime(self) -> None:
+        with self._session_runtime_lock:
+            self._session_runtime.clear()
 
     def _extract_is_playing(self, payload: Any) -> bool | None:
         if isinstance(payload, bool):
@@ -1215,3 +1294,187 @@ class CiderAgentService:
         if not item_id:
             raise CiderValidationError("Resolved track did not include a playable id.")
         return self.play_later({"id": item_id, "type": kind, "isLibrary": is_library})
+
+    def _finalize_output(self, payload: Any) -> Any:
+        if self.response_detail() == "debug":
+            return payload
+        return self._compact_output(payload)
+
+    def _compact_resolved_action(self, action: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        if self.response_detail() == "debug":
+            return {
+                "action": action,
+                "parameters": parameters,
+            }
+        return {"action": action}
+
+    def _compact_output(self, value: Any) -> Any:
+        if isinstance(value, list):
+            return [self._compact_output(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        if self._looks_like_session_execution(value):
+            return self._compact_session_execution(value)
+        if self._looks_like_session_status(value):
+            return self._compact_session_status(value)
+        if self._looks_like_play_candidate_result(value):
+            return self._compact_play_candidate_result(value)
+
+        if self._looks_like_track(value):
+            return self._compact_track(value)
+        if self._looks_like_playlist(value):
+            return self._compact_playlist(value)
+        if self._looks_like_album(value):
+            return self._compact_album(value)
+        if self._looks_like_artist(value):
+            return self._compact_artist(value)
+
+        compact: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "raw":
+                continue
+            if key in {"tracks", "candidate_tracks"} and isinstance(item, list):
+                compact[key] = [self._compact_track(track) if isinstance(track, dict) else track for track in item]
+                continue
+            if key in {"selected_track", "track"} and isinstance(item, dict):
+                compact[key] = self._compact_track(item)
+                continue
+            if key == "items" and isinstance(item, list):
+                compact[key] = [self._compact_queue_item(queue_item) for queue_item in item]
+                continue
+            if key == "playlists" and isinstance(item, list):
+                compact[key] = [self._compact_playlist(playlist) if isinstance(playlist, dict) else playlist for playlist in item]
+                continue
+            if key == "playlist" and isinstance(item, dict):
+                compact[key] = self._compact_playlist(item)
+                continue
+            if key == "albums" and isinstance(item, list):
+                compact[key] = [self._compact_album(album) if isinstance(album, dict) else album for album in item]
+                continue
+            if key == "artists" and isinstance(item, list):
+                compact[key] = [self._compact_artist(artist) if isinstance(artist, dict) else artist for artist in item]
+                continue
+            compact[key] = self._compact_output(item)
+        return compact
+
+    def _compact_track(self, track: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        for key in (
+            "title",
+            "artist",
+            "album",
+            "duration_millis",
+        ):
+            if key in track:
+                compact[key] = track[key]
+        return compact
+
+    def _compact_playlist(self, playlist: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: playlist[key]
+            for key in ("id", "type", "href", "name", "description", "can_edit", "is_public")
+            if key in playlist
+        }
+
+    def _compact_album(self, album: dict[str, Any]) -> dict[str, Any]:
+        return {key: album[key] for key in ("id", "type", "href", "name", "artist", "track_count") if key in album}
+
+    def _compact_artist(self, artist: dict[str, Any]) -> dict[str, Any]:
+        return {key: artist[key] for key in ("id", "type", "href", "name") if key in artist}
+
+    def _compact_queue_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        if "index" in item:
+            compact["index"] = item["index"]
+        if isinstance(item.get("track"), dict):
+            compact["track"] = self._compact_track(item["track"])
+        return compact
+
+    def _compact_session_execution(self, value: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {
+            "status": value.get("status"),
+            "mode": value.get("mode"),
+        }
+        session = value.get("session")
+        if isinstance(session, dict):
+            compact["session"] = {
+                "id": session.get("id"),
+                "is_active": session.get("is_active"),
+            }
+        result = value.get("result")
+        if isinstance(result, dict):
+            compact["result"] = self._compact_session_refill_result(result)
+        return compact
+
+    def _compact_session_refill_result(self, value: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {
+            "status": value.get("status"),
+            "selection_strategy": value.get("selection_strategy"),
+            "enqueued_count": value.get("enqueued_count", 0),
+        }
+        playback = value.get("playback")
+        if isinstance(playback, dict):
+            compact["playback"] = self._compact_output(playback)
+        tracks = value.get("tracks")
+        if isinstance(tracks, list) and tracks:
+            compact["primary_track"] = self._compact_track(tracks[0]) if isinstance(tracks[0], dict) else tracks[0]
+        return compact
+
+    def _compact_session_status(self, value: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {
+            "status": value.get("status"),
+            "session": None,
+        }
+        session = value.get("session")
+        if isinstance(session, dict):
+            compact["session"] = {
+                "id": session.get("id"),
+                "is_active": session.get("is_active"),
+                "mode": session.get("mode"),
+            }
+        recent_tracks = value.get("recent_tracks")
+        if isinstance(recent_tracks, list):
+            compact["recent_tracks"] = [self._compact_recent_track(track) for track in recent_tracks[:5] if isinstance(track, dict)]
+        return compact
+
+    def _compact_recent_track(self, track: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: track.get(key)
+            for key in ("track_id", "title", "artist", "album")
+            if key in track
+        }
+
+    def _compact_play_candidate_result(self, value: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {
+            "status": value.get("status"),
+            "selection_strategy": value.get("selection_strategy"),
+        }
+        if "selected_query" in value:
+            compact["selected_query"] = value.get("selected_query")
+        if isinstance(value.get("selected_track"), dict):
+            compact["selected_track"] = self._compact_track(value["selected_track"])
+        if isinstance(value.get("playback"), dict):
+            compact["playback"] = self._compact_output(value["playback"])
+        return compact
+
+    def _looks_like_track(self, value: dict[str, Any]) -> bool:
+        return "title" in value and ("artist" in value or "play_params" in value or "track_id" in value)
+
+    def _looks_like_playlist(self, value: dict[str, Any]) -> bool:
+        return "name" in value and ("can_edit" in value or "is_public" in value) and "title" not in value
+
+    def _looks_like_album(self, value: dict[str, Any]) -> bool:
+        return "name" in value and "track_count" in value and "title" not in value
+
+    def _looks_like_artist(self, value: dict[str, Any]) -> bool:
+        return "name" in value and "track_count" not in value and "can_edit" not in value and "title" not in value and "artist" not in value
+
+    def _looks_like_session_execution(self, value: dict[str, Any]) -> bool:
+        return "mode" in value and "session" in value and "result" in value
+
+    def _looks_like_session_status(self, value: dict[str, Any]) -> bool:
+        return "session" in value and "recent_tracks" in value and "mode" not in value
+
+    def _looks_like_play_candidate_result(self, value: dict[str, Any]) -> bool:
+        return "selection_strategy" in value and ("selected_track" in value or "selected_query" in value)

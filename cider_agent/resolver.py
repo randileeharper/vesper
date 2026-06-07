@@ -148,7 +148,7 @@ class OpenAICompatibleResolver:
 
     def _build_messages(self, text: str, service: Any) -> list[dict[str, str]]:
         playback = service.playback_snapshot()
-        active_session = service.session_status(include_recent_tracks=False).get("session")
+        active_session = service.session_status(include_recent_tracks=False, compact=False).get("session")
         context = {
             "current_timestamp": service.current_timestamp(),
             "default_search_source": service.default_search_source(),

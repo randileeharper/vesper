@@ -46,25 +46,52 @@ class FakeSession:
 
 
 class StubRpcClient:
+    def __init__(self) -> None:
+        self.is_playing = True
+        self.volume = 0.5
+        self.current_track = self._track(
+            "track-1",
+            "Track",
+            "Artist",
+            "Album",
+            is_library=True,
+        )
+        self.queue_items = [self._track("queued-track", "Queued", "Queued Artist", "Queued Album")]
+        self.posts: list[dict[str, Any]] = []
+
+    def _track(
+        self,
+        track_id: str,
+        title: str,
+        artist: str = "Artist",
+        album: str = "Album",
+        *,
+        is_library: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "id": track_id,
+            "type": "songs",
+            "attributes": {
+                "name": title,
+                "artistName": artist,
+                "albumName": album,
+                "playParams": {"id": track_id, "kind": "songs", "isLibrary": is_library},
+                "durationInMillis": 180000,
+            },
+        }
+
     def close(self) -> None:
         return None
 
     def playback_get(self, path: str):
         if path == "/now-playing":
-            return {
-                "info": {
-                    "name": "Track",
-                    "artistName": "Artist",
-                    "albumName": "Album",
-                    "playParams": {"id": "track-1", "kind": "songs", "isLibrary": True},
-                }
-            }
+            return {"info": self.current_track["attributes"] if self.current_track is not None else {}}
         if path == "/queue":
-            return [{"id": "queued-track", "attributes": {"name": "Queued"}}]
+            return self.queue_items
         if path == "/is-playing":
-            return {"status": "ok", "is_playing": True}
+            return {"status": "ok", "is_playing": self.is_playing}
         if path == "/volume":
-            return {"volume": 0.5}
+            return {"volume": self.volume}
         if path == "/repeat-mode":
             return {"value": 0}
         if path == "/shuffle-mode":
@@ -74,7 +101,34 @@ class StubRpcClient:
         return {"value": True}
 
     def playback_post(self, path: str, body=None):
+        self.posts.append({"path": path, "body": body})
+        if path == "/pause":
+            self.is_playing = False
+        elif path == "/play":
+            self.is_playing = True
+        elif path == "/stop":
+            self.is_playing = False
+        elif path == "/next":
+            self.is_playing = False
+            self.current_track = None
+        elif path == "/volume" and isinstance(body, dict):
+            self.volume = body.get("volume", self.volume)
+        elif path == "/play-item" and isinstance(body, dict):
+            item_id = str(body.get("id", "")).strip()
+            self.current_track = self._catalog_track_for_id(item_id)
+            self.is_playing = True
+        elif path == "/queue/clear-queue":
+            self.queue_items = []
         return {"path": path, "body": body}
+
+    def _catalog_track_for_id(self, item_id: str) -> dict[str, Any]:
+        catalog_map = {
+            "catalog-track-favorite": self._track("catalog-track-favorite", "Liked Song", "Favorite Artist"),
+            "catalog-track-2": self._track("catalog-track-2", "Another Song", "Favorite Artist"),
+            "catalog-track-3": self._track("catalog-track-3", "Third Song", "Favorite Artist"),
+            "catalog-track-1": self._track("catalog-track-1", "k-pop", "Catalog Artist"),
+        }
+        return catalog_map.get(item_id, self._track(item_id or "unknown-track", item_id or "Unknown"))
 
     def search_catalog(self, query: str, *, limit: int, storefront: str):
         if query == "Favorite Artist Liked Song":
@@ -90,6 +144,48 @@ class StubRpcClient:
                                         "name": "Liked Song",
                                         "artistName": "Favorite Artist",
                                         "playParams": {"id": "catalog-track-favorite", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        if query == "Favorite Artist Another Song":
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": "catalog-track-2",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Another Song",
+                                        "artistName": "Favorite Artist",
+                                        "albumName": "Album",
+                                        "playParams": {"id": "catalog-track-2", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        if query == "Favorite Artist Third Song":
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": "catalog-track-3",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Third Song",
+                                        "artistName": "Favorite Artist",
+                                        "albumName": "Album",
+                                        "playParams": {"id": "catalog-track-3", "kind": "songs", "isLibrary": False},
                                     },
                                 }
                             ]
@@ -192,6 +288,9 @@ class StubRpcClient:
 
 
 class StubResolver:
+    def __init__(self) -> None:
+        self.session_plan_calls = 0
+
     def resolve(self, text: str, service: Any) -> ResolvedAction:
         normalized = text.strip().lower()
         if "kep1er" in normalized:
@@ -213,11 +312,18 @@ class StubResolver:
         return ResolvedAction(action="status", parameters={}, resolver="stub")
 
     def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int):
+        self.session_plan_calls += 1
+        if self.session_plan_calls == 1:
+            candidate_tracks = [{"title": "Liked Song", "artist": "Favorite Artist"}]
+        elif self.session_plan_calls == 2:
+            candidate_tracks = [{"title": "Another Song", "artist": "Favorite Artist"}]
+        else:
+            candidate_tracks = [{"title": "Third Song", "artist": "Favorite Artist"}]
         return type(
             "Plan",
             (),
             {
-                "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
+                "candidate_tracks": candidate_tracks,
                 "candidate_artists": ["Favorite Artist"],
                 "candidate_queries": [request],
                 "resolver": "stub",

@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 import uvicorn
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -224,8 +226,18 @@ def _execute_message(message: dict[str, Any], *, task_id: str | None = None, con
     return task
 
 
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    service = get_service()
+    service.start_background_session_worker()
+    try:
+        yield
+    finally:
+        service.stop_background_session_worker()
+
+
 def create_a2a_app() -> FastAPI:
-    app = FastAPI(title="Cider Agent", version="0.1.0")
+    app = FastAPI(title="Cider Agent", version="0.1.0", lifespan=_lifespan)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

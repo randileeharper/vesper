@@ -91,6 +91,10 @@ def test_handle_text_request_can_start_adaptive_session(service) -> None:
     assert result["resolved_action"]["action"] == "play_session"
     assert result["execution"]["action"] == "play_session"
     assert result["execution"]["result"]["mode"] == "adaptive-session"
+    assert "request_id" not in result["execution"]
+    assert "plan" not in result["execution"]["result"]["result"]
+    assert result["execution"]["result"]["result"]["enqueued_count"] == 0
+    assert "primary_track" in result["execution"]["result"]["result"]
 
 
 def test_steer_session_updates_active_session(service) -> None:
@@ -99,7 +103,7 @@ def test_steer_session_updates_active_session(service) -> None:
     result = service.steer_session("more pop")
 
     assert result["session"]["steering_history"][-1] == "more pop"
-    assert result["result"]["selection_strategy"] == "adaptive-session-refill"
+    assert result["result"]["selection_strategy"] == "adaptive-session-steer"
 
 
 def test_session_status_includes_recent_tracks(service) -> None:
@@ -109,6 +113,46 @@ def test_session_status_includes_recent_tracks(service) -> None:
 
     assert status["session"] is not None
     assert isinstance(status["recent_tracks"], list)
+    assert "request_text" not in status["session"]
+
+
+def test_status_is_trimmed_and_includes_queue_tracks(service) -> None:
+    status = service.status()
+
+    assert status["status"] == "ok"
+    assert "config" not in status
+    assert "queue" in status
+    assert status["queue"]["count"] == 1
+    assert status["queue"]["tracks"][0]["title"] == "Queued"
+    assert "id" not in status["queue"]["tracks"][0]
+
+
+def test_next_track_advances_active_session_without_native_queue(service) -> None:
+    service.play_session("play upbeat music")
+
+    result = service.next_track()
+
+    assert result["status"] == "ok"
+    assert result["selection_strategy"] == "adaptive-session-skip"
+    assert result["tracks"][0]["title"] == "Another Song"
+    assert service._rpc.posts[-1]["path"] == "/play-item"
+
+
+def test_session_worker_advances_when_playback_stops(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    service._rpc.current_track = None
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+
+    assert service._should_advance_session(session, service.playback_snapshot()) is True
+
+    result = service._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
+
+    assert result["selection_strategy"] == "adaptive-session-auto-advance"
+    assert result["tracks"][0]["title"] == "Another Song"
 
 
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:
@@ -212,6 +256,25 @@ def test_play_candidate_match_prefers_track_candidate(service) -> None:
 
     assert result["selection_strategy"] == "candidate_track_exactish_match"
     assert result["selected_track"]["play_params"]["id"] == "catalog-track-favorite"
+
+
+def test_run_action_compacts_track_payloads_by_default(service) -> None:
+    result = service.run_action(
+        "play_candidate_match",
+        {
+            "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
+        },
+    )
+
+    selected_track = result["result"]["selected_track"]
+    assert "raw" not in selected_track
+    assert selected_track["title"] == "Liked Song"
+    assert selected_track["artist"] == "Favorite Artist"
+    assert "id" not in selected_track
+    assert "href" not in selected_track
+    assert "play_params" not in selected_track
+    assert "type" not in selected_track
+    assert "request_id" not in result
 
 
 def test_run_action_play_candidate_match_accepts_singular_query_alias(service) -> None:

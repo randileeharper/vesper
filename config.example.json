@@ -10,6 +10,7 @@
   "resolver_api_key": "your-openai-compatible-key",
   "resolver_include_reasoning": false,
   "resolver_include_raw_output": false,
+  "response_detail": "compact",
   "session_recent_tracks_limit": 20,
   "request_timeout_seconds": 60.0,
   "verify_tls": true,
