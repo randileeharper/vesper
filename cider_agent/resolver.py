@@ -208,12 +208,14 @@ class OpenAICompatibleResolver:
                 "If the user asks for a vibe, era, popularity, activity, time-of-day, or descriptive request, prefer play_session.",
                 "If the user asks for something by an artist without naming a specific track, prefer play_session.",
                 "If there is an active session and the user asks for a change like 'more pop' or 'more of this artist', prefer steer_session.",
+                "If there is an active session and the new request implies a major change of activity, mood, or context, starting a new play_session is acceptable.",
                 "If there is an active session and the user says things like 'I don't like this', 'skip this', 'not this one', or otherwise rejects only the current track, prefer reject_current_track instead of changing the whole session vibe.",
                 "For play_candidate_match, provide candidate_tracks as [{'title': ..., 'artist': ...}] when possible.",
                 "For play_candidate_match, provide candidate_artists only as fallback support.",
                 "For play_candidate_match, always include candidate_queries for descriptive requests as last-resort fallback search phrases.",
                 "Do not invent fake artists or track titles. Prefer real, attributable music. If uncertain, rely more on candidate_queries.",
                 "If the user names an artist but not a specific song, do not guess a current track from memory. Prefer artist-driven live catalog selection via play_session or candidate_artists.",
+                "For play_session and steer_session, use the parameter name 'request'. Do not use 'request_text' or any alternate field names.",
                 "Bad fallback query example: 'popular songs by Pink'. Better candidate artist: 'P!nk'. Better candidate tracks might be her known singles.",
                 "If the user asks what is playing, use get_now_playing.",
                 "If the user asks to resume, use play. If the user asks to pause, use pause.",
@@ -227,6 +229,7 @@ class OpenAICompatibleResolver:
             "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something. "
             "Treat generic or descriptive play requests as adaptive long-form listening sessions. "
             "When a user gives negative feedback about only the currently playing song, reject just that track rather than changing the whole session. "
+            "You may infer a helpful music request from surrounding life context when the user is clearly asking for music help, such as cleaning, studying, waking up, or winding down. "
             "For descriptive playback requests, propose concrete track and artist candidates rather than a literal English search phrase. "
             "Never invent obviously fake artist or song names; if you are unsure, include candidate_queries fallback phrases."
         )
@@ -351,10 +354,13 @@ class OpenAICompatibleResolver:
             normalized.pop("candidate_query", None)
         if action in {"play_session", "steer_session"}:
             request = normalized.get("request")
+            if not isinstance(request, str):
+                request = normalized.get("request_text")
             if isinstance(request, str):
                 normalized["request"] = request.strip()
             elif original_text.strip():
                 normalized["request"] = original_text.strip()
+            normalized.pop("request_text", None)
         return normalized
 
     def _normalize_query_text(self, query: str) -> str:

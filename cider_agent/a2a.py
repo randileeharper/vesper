@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -74,6 +75,39 @@ class TaskStore:
 
 TASK_STORE = TaskStore()
 
+READ_ONLY_ACTIONS = {
+    "status",
+    "get_now_playing",
+    "playback_snapshot",
+    "is_playing",
+    "get_volume",
+    "get_repeat_mode",
+    "get_shuffle_mode",
+    "get_autoplay",
+    "get_queue",
+    "session_status",
+    "search",
+    "search_catalog",
+    "search_library",
+    "search_catalog_tracks",
+    "search_library_tracks",
+    "list_library_playlists",
+    "search_library_playlists",
+    "get_library_playlist",
+    "get_library_playlist_tracks",
+    "list_preferences",
+    "recommend",
+    "list_recently_played",
+}
+
+READ_ONLY_TEXT_PATTERNS = [
+    r"^\s*status\s*$",
+    r"^\s*what('?s| is)\s+playing\??\s*$",
+    r"^\s*now\s+playing\??\s*$",
+    r"^\s*session\s+status\??\s*$",
+    r"^\s*queue\s+status\??\s*$",
+]
+
 
 def build_agent_card() -> dict[str, Any]:
     settings = get_settings()
@@ -127,6 +161,27 @@ def _jsonrpc_error(code: int, message: str, data: Any = None) -> dict[str, Any]:
     if data is not None:
         payload["data"] = data
     return payload
+
+
+def _is_read_only_action(action: str) -> bool:
+    return action in READ_ONLY_ACTIONS
+
+
+def _is_read_only_text_request(text: str) -> bool:
+    return any(re.match(pattern, text, flags=re.IGNORECASE) for pattern in READ_ONLY_TEXT_PATTERNS)
+
+
+def _should_defer_message(message: dict[str, Any]) -> bool:
+    parts = message.get("parts", [])
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("kind") == "data" and isinstance(part.get("data"), dict):
+            action = str(part["data"].get("action", "")).strip()
+            return not _is_read_only_action(action)
+        if part.get("kind") == "text":
+            return not _is_read_only_text_request(str(part.get("text", "")))
+    return False
 
 
 def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
@@ -184,6 +239,57 @@ def _task_from_result(
     }
 
 
+def _submitted_task(*, task_id: str, context_id: str, request_message: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": "task",
+        "id": task_id,
+        "contextId": context_id,
+        "status": {
+            "state": "submitted",
+            "timestamp": _iso_now(),
+            "message": _message(
+                "agent",
+                [_text_part("Request accepted."), _data_part({"status": "submitted"})],
+                task_id=task_id,
+            ),
+        },
+        "artifacts": [],
+        "history": [
+            request_message,
+            _message("agent", [_text_part("Request accepted."), _data_part({"status": "submitted"})], task_id=task_id),
+        ],
+        "metadata": {"summary": "Request accepted."},
+    }
+
+
+def _failed_task(
+    *,
+    task: dict[str, Any],
+    message: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    task["status"] = {
+        "state": "failed",
+        "timestamp": _iso_now(),
+        "message": _message(
+            "agent",
+            [_text_part(message), _data_part(payload or {"status": "error", "message": message})],
+            task_id=task["id"],
+        ),
+    }
+    if payload is not None:
+        task["artifacts"] = [_artifact(payload)]
+    task["history"].append(
+        _message(
+            "agent",
+            [_text_part(message), _data_part(payload or {"status": "error", "message": message})],
+            task_id=task["id"],
+        )
+    )
+    task["metadata"]["summary"] = message
+    return task
+
+
 def _execute_message(message: dict[str, Any], *, task_id: str | None = None, context_id: str | None = None) -> dict[str, Any]:
     service = get_service()
     action, parameters, resolved = _extract_action(message, service)
@@ -208,6 +314,40 @@ def _execute_message(message: dict[str, Any], *, task_id: str | None = None, con
             task["metadata"]["resolver_raw_action"] = resolved["resolver_raw_action"]
     TASK_STORE.save(task)
     return task
+
+
+def _complete_submitted_task(task: dict[str, Any], completed: dict[str, Any]) -> dict[str, Any]:
+    task["status"] = completed["status"]
+    task["artifacts"] = completed["artifacts"]
+    task["history"] = completed["history"]
+    task["metadata"].update(completed.get("metadata", {}))
+    return task
+
+
+async def _execute_message_background(message: dict[str, Any], *, task_id: str, context_id: str) -> None:
+    try:
+        completed = await asyncio.to_thread(
+            _execute_message,
+            message,
+            task_id=task_id,
+            context_id=context_id,
+        )
+    except TextRequestExecutionError as exc:
+        task = TASK_STORE.get(task_id)
+        if task is None:
+            return
+        TASK_STORE.save(_failed_task(task=task, message=str(exc), payload=exc.payload))
+        return
+    except CiderAgentError as exc:
+        task = TASK_STORE.get(task_id)
+        if task is None:
+            return
+        TASK_STORE.save(_failed_task(task=task, message=str(exc)))
+        return
+    task = TASK_STORE.get(task_id)
+    if task is None:
+        return
+    TASK_STORE.save(_complete_submitted_task(task, completed))
 
 
 @asynccontextmanager
@@ -248,21 +388,56 @@ def create_a2a_app() -> FastAPI:
                 message = params.get("message")
                 if not isinstance(message, dict):
                     raise CiderValidationError("message/send requires params.message.")
-                task = _execute_message(
-                    message,
-                    task_id=params.get("taskId"),
-                    context_id=message.get("contextId") or params.get("contextId"),
-                )
+                resolved_task_id = str(params.get("taskId") or uuid.uuid4())
+                resolved_context_id = str(message.get("contextId") or params.get("contextId") or uuid.uuid4())
+                if _should_defer_message(message):
+                    task = _submitted_task(
+                        task_id=resolved_task_id,
+                        context_id=resolved_context_id,
+                        request_message=message,
+                    )
+                    TASK_STORE.save(task)
+                    asyncio.create_task(
+                        _execute_message_background(
+                            message,
+                            task_id=resolved_task_id,
+                            context_id=resolved_context_id,
+                        )
+                    )
+                else:
+                    task = _execute_message(
+                        message,
+                        task_id=resolved_task_id,
+                        context_id=resolved_context_id,
+                    )
                 return _jsonrpc_response(request_id, result=task)
             if method == "message/stream":
                 message = params.get("message")
                 if not isinstance(message, dict):
                     raise CiderValidationError("message/stream requires params.message.")
-                task = _execute_message(
-                    message,
-                    task_id=params.get("taskId"),
-                    context_id=message.get("contextId") or params.get("contextId"),
-                )
+                resolved_task_id = str(params.get("taskId") or uuid.uuid4())
+                resolved_context_id = str(message.get("contextId") or params.get("contextId") or uuid.uuid4())
+                deferred = _should_defer_message(message)
+                if deferred:
+                    task = _submitted_task(
+                        task_id=resolved_task_id,
+                        context_id=resolved_context_id,
+                        request_message=message,
+                    )
+                    TASK_STORE.save(task)
+                    asyncio.create_task(
+                        _execute_message_background(
+                            message,
+                            task_id=resolved_task_id,
+                            context_id=resolved_context_id,
+                        )
+                    )
+                else:
+                    task = _execute_message(
+                        message,
+                        task_id=resolved_task_id,
+                        context_id=resolved_context_id,
+                    )
 
                 async def event_stream():
                     submitted = {
@@ -280,7 +455,17 @@ def create_a2a_app() -> FastAPI:
                         },
                     }
                     yield f"data: {json.dumps(submitted)}\n\n"
-                    await asyncio.sleep(0)
+                    if deferred:
+                        while True:
+                            await asyncio.sleep(0.1)
+                            current = TASK_STORE.get(task["id"])
+                            if current is None:
+                                continue
+                            if current["status"]["state"] in {"completed", "failed", "cancelled", "rejected"}:
+                                task.update(current)
+                                break
+                    else:
+                        await asyncio.sleep(0)
                     completed = {
                         "jsonrpc": "2.0",
                         "id": request_id,

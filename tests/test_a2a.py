@@ -55,3 +55,61 @@ def test_agent_card_is_published(monkeypatch) -> None:
     assert payload["url"] == "http://127.0.0.1:8766/a2a"
     assert "plain-language requests" in payload["description"]
     assert payload["skills"][0]["inputModes"] == ["text/plain"]
+
+
+def test_should_defer_message_for_mutating_text_request() -> None:
+    message = {
+        "kind": "message",
+        "messageId": "m-3",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "play upbeat morning music"}],
+    }
+
+    assert a2a._should_defer_message(message) is True
+
+
+def test_should_not_defer_message_for_status_text_request() -> None:
+    message = {
+        "kind": "message",
+        "messageId": "m-4",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "what's playing?"}],
+    }
+
+    assert a2a._should_defer_message(message) is False
+
+
+def test_should_defer_message_for_mutating_structured_action() -> None:
+    message = {
+        "kind": "message",
+        "messageId": "m-5",
+        "role": "user",
+        "parts": [{"kind": "data", "data": {"action": "play_session", "parameters": {"request": "play upbeat music"}}}],
+    }
+
+    assert a2a._should_defer_message(message) is True
+
+
+def test_complete_submitted_task_updates_state() -> None:
+    request = {
+        "kind": "message",
+        "messageId": "m-6",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "play something upbeat"}],
+    }
+    task = a2a._submitted_task(task_id="task-1", context_id="ctx-1", request_message=request)
+    completed = a2a._complete_submitted_task(
+        task,
+        {
+            "kind": "task",
+            "id": "task-1",
+            "contextId": "ctx-1",
+            "status": {"state": "completed", "timestamp": "2026-06-07T00:00:00Z"},
+            "artifacts": [{"artifactId": "artifact-1", "name": "cider-agent-result", "parts": [{"kind": "data", "data": {"status": "ok"}}]}],
+            "history": [request],
+            "metadata": {"action": "play_session", "summary": "playing something upbeat"},
+        },
+    )
+
+    assert completed["status"]["state"] == "completed"
+    assert completed["metadata"]["action"] == "play_session"
