@@ -79,7 +79,11 @@ class Settings:
     cider_base_url: str = "http://localhost:10767"
     cider_api_token: str | None = None
     default_search_source: str = "catalog"
-    request_timeout_seconds: float = 10.0
+    resolver_backend: str = "fallback"
+    resolver_base_url: str = "https://api.openai.com/v1"
+    resolver_model: str | None = None
+    resolver_api_key: str | None = None
+    request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
     database_path: Path = Path("~/.local/share/cider-agent/cider-agent.db").expanduser()
@@ -101,8 +105,16 @@ class Settings:
         default_search_source = str(
             _config_or_env(config, "CIDER_AGENT_DEFAULT_SEARCH_SOURCE", "default_search_source", "catalog")
         ).strip().lower()
+        resolver_backend = str(
+            _config_or_env(config, "CIDER_AGENT_RESOLVER_BACKEND", "resolver_backend", "fallback")
+        ).strip().lower()
+        resolver_base_url = str(
+            _config_or_env(config, "CIDER_AGENT_RESOLVER_BASE_URL", "resolver_base_url", "https://api.openai.com/v1")
+        ).strip().rstrip("/")
+        resolver_model_raw = _config_or_env(config, "CIDER_AGENT_RESOLVER_MODEL", "resolver_model")
+        resolver_api_key_raw = _config_or_env(config, "CIDER_AGENT_RESOLVER_API_KEY", "resolver_api_key")
         request_timeout_seconds = float(
-            _config_or_env(config, "CIDER_AGENT_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 10.0)
+            _config_or_env(config, "CIDER_AGENT_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 60.0)
         )
         verify_tls = _as_bool(_config_or_env(config, "CIDER_AGENT_VERIFY_TLS", "verify_tls", True))
         log_level = str(_config_or_env(config, "CIDER_AGENT_LOG_LEVEL", "log_level", "INFO")).strip().upper()
@@ -118,6 +130,8 @@ class Settings:
         ).expanduser()
 
         cider_api_token = str(cider_api_token_raw).strip() if cider_api_token_raw is not None else None
+        resolver_model = str(resolver_model_raw).strip() if resolver_model_raw is not None else None
+        resolver_api_key = str(resolver_api_key_raw).strip() if resolver_api_key_raw is not None else None
 
         if not http_host:
             raise CiderConfigError("http_host cannot be empty.")
@@ -129,6 +143,12 @@ class Settings:
             raise CiderConfigError("cider_base_url cannot be empty.")
         if default_search_source not in {"catalog", "library"}:
             raise CiderConfigError("default_search_source must be either 'catalog' or 'library'.")
+        if resolver_backend not in {"fallback", "openai_compatible"}:
+            raise CiderConfigError("resolver_backend must be either 'fallback' or 'openai_compatible'.")
+        if not resolver_base_url:
+            raise CiderConfigError("resolver_base_url cannot be empty.")
+        if resolver_backend == "openai_compatible" and not resolver_model:
+            raise CiderConfigError("resolver_model is required when resolver_backend is openai_compatible.")
         if request_timeout_seconds <= 0:
             raise CiderConfigError("request_timeout_seconds must be positive.")
         if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
@@ -141,6 +161,10 @@ class Settings:
             cider_base_url=cider_base_url,
             cider_api_token=cider_api_token,
             default_search_source=default_search_source,
+            resolver_backend=resolver_backend,
+            resolver_base_url=resolver_base_url,
+            resolver_model=resolver_model,
+            resolver_api_key=resolver_api_key,
             request_timeout_seconds=request_timeout_seconds,
             verify_tls=verify_tls,
             log_level=log_level,
@@ -159,6 +183,10 @@ class Settings:
             "cider_base_url": self.cider_base_url,
             "has_cider_api_token": bool(self.cider_api_token),
             "default_search_source": self.default_search_source,
+            "resolver_backend": self.resolver_backend,
+            "resolver_base_url": self.resolver_base_url,
+            "resolver_model": self.resolver_model,
+            "has_resolver_api_key": bool(self.resolver_api_key),
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,
             "log_level": self.log_level,

@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 from .config import Settings
 from .errors import CiderRpcError, CiderValidationError
+from .resolver import ResolvedAction, Resolver, build_resolver
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore
 
@@ -167,14 +168,19 @@ class CiderAgentService:
         rpc_client: CiderRpcClient | None = None,
         preference_store: PreferenceStore | None = None,
         recommender: DeterministicRecommender | None = None,
+        resolver: Resolver | None = None,
     ) -> None:
         self._settings = settings
         self._rpc = rpc_client or CiderRpcClient(settings)
         self._preferences = preference_store or PreferenceStore(settings.database_path)
         self._recommender = recommender or DeterministicRecommender()
+        self._resolver = resolver or build_resolver(settings)
 
     def close(self) -> None:
         self._rpc.close()
+        close = getattr(self._resolver, "close", None)
+        if callable(close):
+            close()
 
     def default_search_source(self) -> str:
         return self._settings.default_search_source
@@ -572,6 +578,23 @@ class CiderAgentService:
             "status": "ok",
             "recommendation": recommendation.as_dict(),
             "playback": play_result,
+        }
+
+    def resolve_text_request(self, text: str) -> ResolvedAction:
+        return self._resolver.resolve(text, self)
+
+    def handle_text_request(self, text: str) -> dict[str, Any]:
+        resolved = self.resolve_text_request(text)
+        execution = self.run_action(resolved.action, resolved.parameters)
+        return {
+            "status": "ok",
+            "input": text,
+            "resolver": resolved.resolver,
+            "resolved_action": {
+                "action": resolved.action,
+                "parameters": resolved.parameters,
+            },
+            "execution": execution,
         }
 
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:

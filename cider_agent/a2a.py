@@ -145,42 +145,7 @@ def _jsonrpc_error(code: int, message: str, data: Any = None) -> dict[str, Any]:
     return payload
 
 
-def _coerce_action_from_text(text: str) -> tuple[str, dict[str, Any]]:
-    normalized = text.strip().lower()
-    if normalized in {"status", "show status"}:
-        return "status", {}
-    if normalized in {"now playing", "what's playing", "what is playing"}:
-        return "get_now_playing", {}
-    if normalized == "play":
-        return "play", {}
-    if normalized == "pause":
-        return "pause", {}
-    if normalized in {"toggle", "playpause"}:
-        return "playpause", {}
-    if normalized == "stop":
-        return "stop", {}
-    if normalized in {"next", "skip"}:
-        return "next_track", {}
-    if normalized == "previous":
-        return "previous_track", {}
-    if normalized.startswith("play something i like"):
-        query = None
-        if ":" in text:
-            _, value = text.split(":", 1)
-            query = value.strip() or None
-        return "play_recommendation", {"query": query}
-    if normalized.startswith("recommend"):
-        query = None
-        if ":" in text:
-            _, value = text.split(":", 1)
-            query = value.strip() or None
-        return "recommend", {"query": query}
-    raise CiderValidationError(
-        "Unsupported freeform text request. Send a data part with {'action': ..., 'parameters': {...}}."
-    )
-
-
-def _extract_action(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     parts = message.get("parts", [])
     for part in parts:
         if not isinstance(part, dict):
@@ -195,9 +160,11 @@ def _extract_action(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                 parameters = {}
             if not isinstance(parameters, dict):
                 raise CiderValidationError("parameters must be an object.")
-            return action, parameters
+            return action, parameters, None
         if part.get("kind") == "text":
-            return _coerce_action_from_text(str(part.get("text", "")))
+            resolved = service.handle_text_request(str(part.get("text", "")))
+            execution = resolved["execution"]
+            return execution["action"], execution["result"], resolved
     raise CiderValidationError("Message did not include a supported text or data part.")
 
 
@@ -232,9 +199,9 @@ def _task_from_result(
 
 
 def _execute_message(message: dict[str, Any], *, task_id: str | None = None, context_id: str | None = None) -> dict[str, Any]:
-    action, parameters = _extract_action(message)
     service = get_service()
-    payload = service.run_action(action, parameters)
+    action, parameters, resolved = _extract_action(message, service)
+    payload = parameters if resolved is not None else service.run_action(action, parameters)
     resolved_task_id = task_id or str(uuid.uuid4())
     resolved_context_id = context_id or str(uuid.uuid4())
     task = _task_from_result(
@@ -244,6 +211,9 @@ def _execute_message(message: dict[str, Any], *, task_id: str | None = None, con
         action=action,
         payload=payload,
     )
+    if resolved is not None:
+        task["metadata"]["resolver"] = resolved["resolver"]
+        task["metadata"]["resolved_action"] = resolved["resolved_action"]
     TASK_STORE.save(task)
     return task
 

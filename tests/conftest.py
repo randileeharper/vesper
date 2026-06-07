@@ -5,12 +5,14 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cider_agent.config import Settings
 from cider_agent.rpc import CiderRpcClient
+from cider_agent.resolver import ResolvedAction
 from cider_agent.service import CiderAgentService
 from cider_agent.storage import PreferenceStore
 
@@ -169,6 +171,18 @@ class StubRpcClient:
         return {"data": {"data": [{"id": "playlist-1", "type": "library-playlists", "attributes": {"name": "Mix"}}]}}
 
 
+class StubResolver:
+    def resolve(self, text: str, service: Any) -> ResolvedAction:
+        normalized = text.strip().lower()
+        if "kep1er" in normalized:
+            return ResolvedAction(
+                action="search",
+                parameters={"query": "kep1er", "limit": 3, "storefront": "us"},
+                resolver="stub",
+            )
+        return ResolvedAction(action="status", parameters={}, resolver="stub")
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
@@ -178,6 +192,10 @@ def settings(tmp_path: Path) -> Settings:
         cider_base_url="http://localhost:10767",
         cider_api_token="secret-token",
         default_search_source="catalog",
+        resolver_backend="fallback",
+        resolver_base_url="https://api.openai.com/v1",
+        resolver_model=None,
+        resolver_api_key=None,
         request_timeout_seconds=10.0,
         verify_tls=True,
         log_level="INFO",
@@ -192,6 +210,7 @@ def service(settings: Settings) -> CiderAgentService:
         settings,
         rpc_client=StubRpcClient(),
         preference_store=PreferenceStore(settings.database_path),
+        resolver=StubResolver(),
     )
 
 

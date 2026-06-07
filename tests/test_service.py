@@ -52,6 +52,14 @@ def test_default_search_uses_catalog_by_default(service) -> None:
     assert result["tracks"][0]["artist"] == "Catalog Artist"
 
 
+def test_handle_text_request_uses_resolver(service) -> None:
+    result = service.handle_text_request("play some kep1er")
+
+    assert result["resolver"] == "stub"
+    assert result["resolved_action"]["action"] == "search"
+    assert result["execution"]["action"] == "search"
+
+
 def test_status_handles_is_playing_payload_shape(service) -> None:
     result = service.status()
 

@@ -26,3 +26,7 @@ class CiderValidationError(CiderAgentError):
 
 class PreferenceStoreError(CiderAgentError):
     """Raised when local persistence fails."""
+
+
+class ResolverError(CiderAgentError):
+    """Raised when the text-to-action resolver fails."""

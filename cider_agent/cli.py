@@ -66,6 +66,9 @@ def _build_parser() -> argparse.ArgumentParser:
     search_catalog.add_argument("--limit", type=int, default=10)
     search_catalog.add_argument("--storefront", default="us")
 
+    ask = subparsers.add_parser("ask")
+    ask.add_argument("text")
+
     playlist = subparsers.add_parser("playlist")
     playlist_subparsers = playlist.add_subparsers(dest="playlist_command", required=True)
     playlist_subparsers.add_parser("list")
@@ -176,6 +179,8 @@ def main() -> None:
                 payload = service.search_library(args.query, limit=args.limit)
             else:
                 payload = service.search_catalog(args.query, limit=args.limit, storefront=args.storefront)
+        elif args.command == "ask":
+            payload = service.handle_text_request(args.text)
         elif args.command == "playlist":
             if args.playlist_command == "list":
                 payload = service.list_library_playlists()
