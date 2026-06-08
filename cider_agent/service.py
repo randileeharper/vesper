@@ -16,7 +16,7 @@ from .config import Settings
 from .action_registry import get_action_definition, list_action_definitions
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
 from .results import EngineActionResult, TextRequestResult
-from .resolver import ResolvedAction, Resolver, SessionPlan, build_resolver
+from .resolver import ResolvedAction, Resolver, SessionQueryPlan, SessionTrackSelection, build_resolver
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore
 
@@ -124,30 +124,6 @@ def _clean_id(value: Any) -> str:
     return "" if cleaned.lower() == "none" else cleaned
 
 
-def _extract_constraint_artist(value: str | None) -> str | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    patterns = [
-        r"\bwith\s+(.+?)\s+vibes?\b",
-        r"\b(.+?)\s+vibes?\b",
-        r"\bin\s+the\s+style\s+of\s+(.+?)\b",
-        r"\blike\s+(.+?)\b",
-        r"^\s*play\s+(?:some|something\s+by|music\s+by)\s+(.+?)\s*$",
-        r"^\s*more\s+of\s+(.+?)\s*$",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        candidate = match.group(1).strip(" .,:;!?\"'")
-        candidate = re.sub(r"^(some|something|music)\s+", "", candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r"\s+(please|for me)$", "", candidate, flags=re.IGNORECASE).strip()
-        if candidate:
-            return candidate
-    return None
-
-
 @dataclass
 class RecommendationResult:
     """Normalized recommendation result."""
@@ -231,9 +207,7 @@ class CiderAgentService:
     SESSION_REFILL_INTERVAL_SECONDS = 5.0
     SESSION_ADVANCE_COOLDOWN_SECONDS = 5.0
     TRACK_SELECTION_POOL_SIZE = 3
-    MAX_SESSION_TRACK_SEARCH_CANDIDATES = 1
-    MAX_SESSION_ARTIST_SEARCH_CANDIDATES = 1
-    MAX_SESSION_QUERY_SEARCH_CANDIDATES = 1
+    SESSION_SEARCH_RESULT_LIMIT = 6
 
     def __init__(
         self,
@@ -870,7 +844,14 @@ class CiderAgentService:
         self._set_session_runtime(session["id"], suspended=False)
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
         self._preferences.add_session_event(session["id"], event_type="session_steered", metadata={"request": request.strip()})
-        result = self._play_session_track(session, selection_strategy="adaptive-session-steer")
+        playback = self.playback_snapshot()
+        result = {
+            "status": "ok",
+            "selection_strategy": "adaptive-session-steer",
+            "playback": playback,
+            "tracks": [],
+            "deferred_until_next_track": True,
+        }
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -1086,10 +1067,10 @@ class CiderAgentService:
                 self._record_current_track_for_session(session, playback=playback)
                 timings["record_current_track_ms"] = _elapsed_ms(record_current_started_at)
                 planning_started_at = time.perf_counter()
-                plan = self._plan_session_tracks(session, count=1)
+                plan = self._plan_session_query(session, count=1)
                 timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
                 collect_started_at = time.perf_counter()
-                tracks = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                tracks, search_query, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
                 timings["collect_tracks_ms"] = _elapsed_ms(collect_started_at)
                 if not tracks:
                     raise CiderValidationError("No playable candidate match could be resolved.")
@@ -1127,9 +1108,11 @@ class CiderAgentService:
                     "enqueued_count": 0,
                     "tracks": [lead_track],
                     "plan": {
-                        "candidate_tracks": plan.candidate_tracks,
-                        "candidate_artists": plan.candidate_artists,
-                        "candidate_queries": plan.candidate_queries,
+                        "search_queries": plan.search_queries,
+                    },
+                    "selection": {
+                        "search_query": search_query,
+                        "selected_index": selection.selected_index,
                     },
                 }
                 if self.include_timing_debug():
@@ -1140,7 +1123,7 @@ class CiderAgentService:
                 self._set_session_runtime(session["id"], advance_in_progress=False, planning_playback_snapshot=None)
                 raise
 
-    def _plan_session_tracks(self, session: dict[str, Any], *, count: int) -> SessionPlan:
+    def _plan_session_query(self, session: dict[str, Any], *, count: int) -> SessionQueryPlan:
         planner = getattr(self._resolver, "plan_session", None)
         if not callable(planner):
             raise CiderValidationError("The configured resolver does not support adaptive play sessions.")
@@ -1156,64 +1139,29 @@ class CiderAgentService:
             return str(session.get("request_text", "")).strip()
         return f"{session.get('request_text', '').strip()} Current steering: {steering_text}".strip()
 
-    def _session_candidate_artists(self, plan: SessionPlan) -> list[str]:
-        candidates: list[str] = []
-        seen: set[str] = set()
-
-        def add(artist_name: str) -> None:
-            key = artist_name.casefold()
-            if key in seen:
-                return
-            seen.add(key)
-            candidates.append(artist_name)
-
-        for artist in plan.candidate_artists:
-            artist_name = str(artist).strip()
-            if not artist_name:
-                continue
-            add(artist_name)
-        for track in plan.candidate_tracks:
-            artist_name = str(track.get("artist", "")).strip()
-            if not artist_name:
-                continue
-            add(artist_name)
-        return candidates
-
-    def _session_constraint_artist(self, session: dict[str, Any], plan: SessionPlan) -> str | None:
-        request_text = str(session.get("request_text", "")).strip()
-        return _extract_constraint_artist(request_text)
-
-    def _query_preserves_constraint_artist(self, query: str, artist: str | None) -> bool:
-        if not artist:
-            return True
-        query_norm = _normalize_match_text(query)
-        artist_norm = _normalize_match_text(artist)
-        return bool(query_norm and artist_norm and artist_norm in query_norm)
-
     def _collect_session_tracks(
         self,
         session: dict[str, Any],
-        plan: SessionPlan,
+        plan: SessionQueryPlan,
         *,
         limit: int,
         timings: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        constraint_artist = self._session_constraint_artist(session, plan)
+    ) -> tuple[list[dict[str, Any]], str, SessionTrackSelection]:
         excluded_ids = self._session_excluded_track_ids(session, include_global=True)
-        chosen = self._collect_session_tracks_with_exclusions(
+        chosen, search_query, selection = self._collect_session_tracks_with_exclusions(
+            session,
             plan,
             limit=limit,
             excluded_ids=excluded_ids,
-            constraint_artist=constraint_artist,
         )
 
-        if not chosen and self.global_recent_tracks_limit() > 0:
+        if not chosen and self.global_recent_tracks_limit() > 0 and search_query:
             relaxed_excluded_ids = self._session_excluded_track_ids(session, include_global=False)
-            chosen = self._collect_session_tracks_with_exclusions(
+            chosen, search_query, selection = self._collect_session_tracks_with_exclusions(
+                session,
                 plan,
                 limit=limit,
                 excluded_ids=relaxed_excluded_ids,
-                constraint_artist=constraint_artist,
             )
             if timings is not None and self.include_timing_debug():
                 timings["relaxed_global_recent_exclusions"] = True
@@ -1228,84 +1176,76 @@ class CiderAgentService:
             timings["candidate_query_search_ms"] = round(getattr(self, "_debug_candidate_query_search_ms", 0.0), 2)
             timings["excluded_track_count"] = len(excluded_ids)
             timings["selected_track_count"] = len(chosen)
+            timings["selection_candidate_count"] = getattr(self, "_debug_selection_candidate_count", 0)
 
-        return chosen
+        return chosen, search_query, selection
 
     def _collect_session_tracks_with_exclusions(
         self,
-        plan: SessionPlan,
+        session: dict[str, Any],
+        plan: SessionQueryPlan,
         *,
         limit: int,
         excluded_ids: set[str],
-        constraint_artist: str | None,
-    ) -> list[dict[str, Any]]:
-        chosen: list[dict[str, Any]] = []
-        seen_ids = set(excluded_ids)
+    ) -> tuple[list[dict[str, Any]], str, SessionTrackSelection]:
         self._debug_candidate_track_search_count = 0
         self._debug_candidate_track_search_ms = 0.0
         self._debug_candidate_artist_search_count = 0
         self._debug_candidate_artist_search_ms = 0.0
+        self._debug_selection_candidate_count = 0
         self._debug_candidate_query_search_count = 0
         self._debug_candidate_query_search_ms = 0.0
+        empty_selection = SessionTrackSelection(selected_index=0, resolver="fallback")
 
-        for candidate in plan.candidate_tracks[: self.MAX_SESSION_TRACK_SEARCH_CANDIDATES]:
-            if len(chosen) >= limit:
-                break
-            title = str(candidate.get("title", "")).strip()
-            artist = str(candidate.get("artist", "")).strip()
-            if not title or not artist:
+        search_queries = list(getattr(plan, "search_queries", None) or getattr(plan, "candidate_queries", []) or [])
+        last_query = ""
+        for query in search_queries:
+            query_text = str(query).strip()
+            if not query_text:
                 continue
+            last_query = query_text
             search_started_at = time.perf_counter()
-            search = self.search_catalog_tracks(f"{artist} {title}", limit=10)
-            self._debug_candidate_track_search_ms += _elapsed_ms(search_started_at)
-            self._debug_candidate_track_search_count += 1
-            match = self._best_track_match(search["tracks"], title=title, artist=artist)
-            if match is None:
-                continue
-            match_id = str(match.get("id", "")).strip()
-            if match_id and match_id in seen_ids:
-                continue
-            chosen.append(match)
-            if match_id:
-                seen_ids.add(match_id)
-
-        for artist in self._session_candidate_artists(plan)[: self.MAX_SESSION_ARTIST_SEARCH_CANDIDATES]:
-            if len(chosen) >= limit:
-                break
-            search_started_at = time.perf_counter()
-            search = self.search_catalog_tracks(str(artist), limit=15)
-            self._debug_candidate_artist_search_ms += _elapsed_ms(search_started_at)
-            self._debug_candidate_artist_search_count += 1
-            for match in self._best_artist_track_matches(search["tracks"], artist=str(artist), limit=limit - len(chosen)):
-                match_id = str(match.get("id", "")).strip()
-                if match_id and match_id in seen_ids:
-                    continue
-                chosen.append(match)
-                if match_id:
-                    seen_ids.add(match_id)
-                if len(chosen) >= limit:
-                    break
-
-        for query in plan.candidate_queries[: self.MAX_SESSION_QUERY_SEARCH_CANDIDATES]:
-            if len(chosen) >= limit:
-                break
-            if not self._query_preserves_constraint_artist(str(query), constraint_artist):
-                continue
-            search_started_at = time.perf_counter()
-            results = self.search(str(query), limit=25)
+            results = self.search_catalog_tracks(query_text, limit=self.SESSION_SEARCH_RESULT_LIMIT)
             self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
             self._debug_candidate_query_search_count += 1
-            for track in self._top_pool_order(list(results.get("tracks", [])), take=limit - len(chosen)):
-                match_id = str(track.get("id", "")).strip()
-                if match_id and match_id in seen_ids:
-                    continue
-                chosen.append(track)
-                if match_id:
-                    seen_ids.add(match_id)
-                if len(chosen) >= limit:
-                    break
+            candidates = self._filter_session_search_candidates(results.get("tracks", []), excluded_ids)
+            self._debug_selection_candidate_count = len(candidates)
+            if not candidates:
+                continue
+            selection = self._select_session_track(session, plan, query_text, candidates)
+            chosen_index = min(selection.selected_index, len(candidates) - 1)
+            return [candidates[chosen_index]][:limit], query_text, selection
 
-        return chosen
+        return [], last_query, empty_selection
+
+    def _filter_session_search_candidates(
+        self,
+        tracks: list[dict[str, Any]],
+        excluded_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for track in tracks:
+            match_id = str(track.get("id", "")).strip()
+            if match_id and (match_id in excluded_ids or match_id in seen_ids):
+                continue
+            filtered.append(track)
+            if match_id:
+                seen_ids.add(match_id)
+        return filtered
+
+    def _select_session_track(
+        self,
+        session: dict[str, Any],
+        plan: SessionQueryPlan,
+        search_query: str,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        chooser = getattr(self._resolver, "select_session_track", None)
+        if not callable(chooser):
+            return SessionTrackSelection(selected_index=0, resolver="fallback")
+        request = self._session_effective_request(session)
+        return chooser(request, self, session, search_query, candidates)
 
     def _session_excluded_track_ids(self, session: dict[str, Any], *, include_global: bool = True) -> set[str]:
         excluded: set[str] = set()
@@ -1700,7 +1640,7 @@ class CiderAgentService:
                     state = "playing" if playback.get("is_playing") else "paused"
                     return f"{state}: {track['title']} by {track['artist']}"
             return "status updated"
-        if action in {"play_session", "steer_session", "refill_session", "reject_current_track", "next_track"}:
+        if action in {"play_session", "refill_session", "reject_current_track", "next_track"}:
             payload = result.get("result", result)
             if isinstance(payload, dict):
                 tracks = payload.get("tracks")
@@ -1713,6 +1653,15 @@ class CiderAgentService:
                 if isinstance(primary, dict) and primary.get("title") and primary.get("artist"):
                     return f"playing {primary['title']} by {primary['artist']}"
             return "session advanced"
+        if action == "steer_session":
+            payload = result.get("result", result)
+            if isinstance(payload, dict):
+                playback = payload.get("playback", {})
+                if isinstance(playback, dict):
+                    track = playback.get("track", {})
+                    if isinstance(track, dict) and track.get("title") and track.get("artist"):
+                        return f"updated session steering; keeping {track['title']} by {track['artist']}"
+            return "updated session steering"
         if action in {"play", "pause", "playpause", "stop"}:
             return action.replace("playpause", "toggled playback")
         if action == "get_now_playing":

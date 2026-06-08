@@ -314,18 +314,38 @@ class StubResolver:
     def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int):
         self.session_plan_calls += 1
         if self.session_plan_calls == 1:
-            candidate_tracks = [{"title": "Liked Song", "artist": "Favorite Artist"}]
+            query = "Favorite Artist Liked Song"
         elif self.session_plan_calls == 2:
-            candidate_tracks = [{"title": "Another Song", "artist": "Favorite Artist"}]
+            query = "Favorite Artist Another Song"
+        elif self.session_plan_calls == 3:
+            query = "Favorite Artist Third Song"
         else:
-            candidate_tracks = [{"title": "Third Song", "artist": "Favorite Artist"}]
+            query = "k-pop"
         return type(
             "Plan",
             (),
             {
-                "candidate_tracks": candidate_tracks,
-                "candidate_artists": ["Favorite Artist"],
-                "candidate_queries": [request],
+                "search_queries": [query],
+                "resolver": "stub",
+                "raw": None,
+                "reasoning": None,
+                "raw_content": None,
+            },
+        )()
+
+    def select_session_track(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_query: str,
+        candidates: list[dict[str, Any]],
+    ):
+        return type(
+            "Selection",
+            (),
+            {
+                "selected_index": 0,
                 "resolver": "stub",
                 "raw": None,
                 "reasoning": None,

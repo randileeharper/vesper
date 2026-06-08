@@ -274,21 +274,15 @@ def test_collect_session_tracks_caps_search_work(settings, service, tmp_path) ->
         "Plan",
         (),
         {
-            "candidate_tracks": [
-                {"title": "One", "artist": "Artist A"},
-                {"title": "Two", "artist": "Artist B"},
-                {"title": "Three", "artist": "Artist C"},
-            ],
-            "candidate_artists": ["Artist X", "Artist Y"],
-            "candidate_queries": ["query one", "query two"],
+            "search_queries": ["query one", "query two"],
         },
     )()
 
     timings: dict[str, object] = {}
     capped_service._collect_session_tracks(session, plan, limit=1, timings=timings)
 
-    assert timings["candidate_track_search_count"] == 1
-    assert timings["candidate_artist_search_count"] == 1
+    assert timings["candidate_track_search_count"] == 0
+    assert timings["candidate_artist_search_count"] == 0
     assert timings["candidate_query_search_count"] == 1
 
 
@@ -299,6 +293,8 @@ def test_steer_session_updates_active_session(service) -> None:
 
     assert result["session"]["steering_history"][-1] == "more pop"
     assert result["result"]["selection_strategy"] == "adaptive-session-steer"
+    assert result["result"]["deferred_until_next_track"] is True
+    assert result["result"]["tracks"] == []
 
 
 def test_session_status_includes_recent_tracks(service) -> None:
@@ -370,15 +366,16 @@ def test_failed_session_start_does_not_leave_active_session(settings, service, t
                 "Plan",
                 (),
                 {
-                    "candidate_tracks": [{"title": "Nope", "artist": "Nobody"}],
-                    "candidate_artists": [],
-                    "candidate_queries": [],
+                    "search_queries": [],
                     "resolver": "stub",
                     "raw": None,
                     "reasoning": None,
                     "raw_content": None,
                 },
             )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
 
     failing_service = CiderAgentService(
         Settings(
@@ -428,19 +425,18 @@ def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_p
                 "Plan",
                 (),
                 {
-                    "candidate_tracks": [
-                        {"title": "Liked Song", "artist": "Favorite Artist"}
-                        if self.plan_calls == 1
-                        else {"title": "Another Song", "artist": "Favorite Artist"}
+                    "search_queries": [
+                        "Favorite Artist Liked Song" if self.plan_calls == 1 else "Favorite Artist Another Song"
                     ],
-                    "candidate_artists": [],
-                    "candidate_queries": [request],
                     "resolver": "stub",
                     "raw": None,
                     "reasoning": None,
                     "raw_content": None,
                 },
             )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
 
     repeat_settings = Settings(
         http_host=settings.http_host,
@@ -490,15 +486,16 @@ def test_collect_session_tracks_relaxes_global_recent_exclusions_when_needed(set
                 "Plan",
                 (),
                 {
-                    "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
-                    "candidate_artists": [],
-                    "candidate_queries": [request],
+                    "search_queries": ["Favorite Artist Liked Song"],
                     "resolver": "stub",
                     "raw": None,
                     "reasoning": None,
                     "raw_content": None,
                 },
             )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
 
     relaxed_settings = Settings(
         http_host=settings.http_host,
@@ -540,14 +537,12 @@ def test_collect_session_tracks_relaxes_global_recent_exclusions_when_needed(set
         "Plan",
         (),
         {
-            "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
-            "candidate_artists": [],
-            "candidate_queries": [],
+            "search_queries": ["Favorite Artist Liked Song"],
         },
     )()
     timings: dict[str, object] = {}
 
-    tracks = relaxed_service._collect_session_tracks(session, plan, limit=1, timings=timings)
+    tracks, _, _ = relaxed_service._collect_session_tracks(session, plan, limit=1, timings=timings)
 
     assert tracks[0]["title"] == "Liked Song"
     assert timings["relaxed_global_recent_exclusions"] is True
@@ -642,15 +637,16 @@ def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) ->
                 "Plan",
                 (),
                 {
-                    "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
-                    "candidate_artists": [],
-                    "candidate_queries": [request],
+                    "search_queries": ["Favorite Artist Liked Song"],
                     "resolver": "stub",
                     "raw": None,
                     "reasoning": None,
                     "raw_content": None,
                 },
             )()
+
+        def select_session_track(self, request: str, service, session: dict[str, object], search_query: str, candidates: list[dict[str, object]]):
+            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
 
     rpc = SnapshotCountingRpcClient()
     snapshot_service = CiderAgentService(
@@ -894,13 +890,11 @@ def test_collect_session_tracks_uses_track_artist_as_fallback_artist(settings, s
         "Plan",
         (),
         {
-            "candidate_tracks": [{"title": "Nandemonaiya (Piano Version)", "artist": "RADWIMPS"}],
-            "candidate_artists": [],
-            "candidate_queries": ["emotional piano music radwimps style"],
+            "search_queries": ["RADWIMPS"],
         },
     )()
 
-    tracks = fallback_service._collect_session_tracks(session, plan, limit=1)
+    tracks, _, _ = fallback_service._collect_session_tracks(session, plan, limit=1)
 
     assert tracks[0]["artist"] == "RADWIMPS"
     assert tracks[0]["title"] == "Nandemonaiya"
@@ -924,7 +918,7 @@ def test_best_track_match_accepts_title_variants(service) -> None:
     assert match["title"] == "Sparkle"
 
 
-def test_collect_session_tracks_rejects_generic_query_fallback_when_artist_constraint_exists(settings, service, tmp_path) -> None:
+def test_collect_session_tracks_uses_real_query_results(settings, service, tmp_path) -> None:
     class ConstraintRpcClient:
         def close(self) -> None:
             return None
@@ -1027,13 +1021,11 @@ def test_collect_session_tracks_rejects_generic_query_fallback_when_artist_const
         "Plan",
         (),
         {
-            "candidate_tracks": [{"title": "Nandemonaiya (Piano Version)", "artist": "RADWIMPS"}],
-            "candidate_artists": [],
-            "candidate_queries": ["cinematic piano music with emotive melodies"],
+            "search_queries": ["RADWIMPS"],
         },
     )()
 
-    tracks = constrained_service._collect_session_tracks(session, plan, limit=1)
+    tracks, _, _ = constrained_service._collect_session_tracks(session, plan, limit=1)
 
     assert tracks[0]["artist"] == "RADWIMPS"
     assert tracks[0]["title"] == "Sparkle"
@@ -1234,6 +1226,5 @@ def test_session_events_distinguish_rejection_steering_skip_and_auto_advance(ser
 
     assert "session_steered" in event_types
     assert "track_rejected" in event_types
-    assert "track_manually_steered" in event_types
     assert "track_manual_skip" in event_types
     assert "track_auto_advanced" in event_types

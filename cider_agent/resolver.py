@@ -27,12 +27,33 @@ class ResolvedAction:
 
 
 @dataclass
-class SessionPlan:
-    """Candidate tracks and fallback queries for an adaptive play session."""
+class SessionQueryPlan:
+    """Search queries for the next step of an adaptive play session."""
 
-    candidate_tracks: list[dict[str, str]]
-    candidate_artists: list[str]
-    candidate_queries: list[str]
+    search_queries: list[str]
+    resolver: str
+    raw: dict[str, Any] | None = None
+    reasoning: str | None = None
+    raw_content: str | None = None
+
+    @property
+    def candidate_queries(self) -> list[str]:
+        return self.search_queries
+
+    @property
+    def candidate_tracks(self) -> list[dict[str, str]]:
+        return []
+
+    @property
+    def candidate_artists(self) -> list[str]:
+        return []
+
+
+@dataclass
+class SessionTrackSelection:
+    """Resolved selection from real catalog search results."""
+
+    selected_index: int
     resolver: str
     raw: dict[str, Any] | None = None
     reasoning: str | None = None
@@ -45,8 +66,18 @@ class Resolver(Protocol):
     def resolve(self, text: str, service: Any) -> ResolvedAction:
         """Resolve text into an action."""
 
-    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionPlan:
-        """Generate the next candidate tracks for an adaptive session."""
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionQueryPlan:
+        """Generate search queries for the next adaptive-session track."""
+
+    def select_session_track(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_query: str,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        """Choose one track from real catalog candidates."""
 
 
 class FallbackResolver:
@@ -71,22 +102,29 @@ class FallbackResolver:
             )
         return ResolvedAction(action=action, parameters={}, resolver="fallback")
 
-    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionPlan:
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionQueryPlan:
         query = request.strip()
-        return SessionPlan(
-            candidate_tracks=[],
-            candidate_artists=[],
-            candidate_queries=[query] if query else [],
+        return SessionQueryPlan(
+            search_queries=[query] if query else [],
             resolver="fallback",
         )
+
+    def select_session_track(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_query: str,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        return SessionTrackSelection(selected_index=0, resolver="fallback")
 
 
 class OpenAICompatibleResolver:
     """Resolve text requests using an OpenAI-compatible chat completions endpoint."""
 
-    MAX_SESSION_CANDIDATE_TRACKS = 1
-    MAX_SESSION_CANDIDATE_ARTISTS = 1
-    MAX_SESSION_CANDIDATE_QUERIES = 1
+    MAX_SESSION_SEARCH_QUERIES = 1
+    MAX_SESSION_SELECTION_CANDIDATES = 6
 
     def __init__(self, settings: Settings, session: httpx.Client | None = None) -> None:
         self._settings = settings
@@ -128,46 +166,51 @@ class OpenAICompatibleResolver:
             raw_content=self._extract_raw_content(content),
         )
 
-    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionPlan:
+    def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionQueryPlan:
         headers = {"Content-Type": "application/json"}
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
         body, content = self._complete_json(self._build_session_messages(request, service, session, count), headers)
         parsed = self._parse_json_object(content)
-        candidate_tracks = self._normalize_candidate_tracks(parsed.get("candidate_tracks"))[: self.MAX_SESSION_CANDIDATE_TRACKS]
-        candidate_artists = self._normalize_candidate_artists(parsed.get("candidate_artists"))[: self.MAX_SESSION_CANDIDATE_ARTISTS]
-        candidate_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))[: self.MAX_SESSION_CANDIDATE_QUERIES]
-        artist_seed = self._extract_artist_seed(request)
-        hard_artist_constraint = self._extract_hard_artist_constraint(request)
-        if hard_artist_constraint and hard_artist_constraint not in candidate_artists:
-            candidate_artists = [hard_artist_constraint, *candidate_artists][: self.MAX_SESSION_CANDIDATE_ARTISTS]
-        if artist_seed and artist_seed not in candidate_artists:
-            candidate_artists = [artist_seed, *candidate_artists][: self.MAX_SESSION_CANDIDATE_ARTISTS]
-        if artist_seed and not self._request_mentions_specific_track(request):
-            candidate_tracks = []
-        if artist_seed and not candidate_queries:
-            candidate_queries = [artist_seed]
-        if hard_artist_constraint:
-            candidate_queries = [
-                query for query in candidate_queries if self._query_preserves_artist_constraint(query, hard_artist_constraint)
-            ]
-            if not candidate_queries:
-                candidate_queries = [hard_artist_constraint]
-        if not candidate_queries:
+        search_queries = self._normalize_candidate_queries(parsed.get("search_queries"))
+        if not search_queries:
+            search_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))
+        if not search_queries:
             synthesized = self._fallback_query_from_text(request)
             if synthesized:
-                candidate_queries = [synthesized]
-        if hard_artist_constraint:
-            candidate_queries = [
-                query for query in candidate_queries if self._query_preserves_artist_constraint(query, hard_artist_constraint)
-            ]
-            if not candidate_queries:
-                candidate_queries = [hard_artist_constraint]
-        candidate_queries = candidate_queries[: self.MAX_SESSION_CANDIDATE_QUERIES]
-        return SessionPlan(
-            candidate_tracks=candidate_tracks,
-            candidate_artists=candidate_artists,
-            candidate_queries=candidate_queries,
+                search_queries = [synthesized]
+        search_queries = search_queries[: self.MAX_SESSION_SEARCH_QUERIES]
+        return SessionQueryPlan(
+            search_queries=search_queries,
+            resolver="openai_compatible",
+            raw=parsed,
+            reasoning=self._extract_reasoning(body),
+            raw_content=self._extract_raw_content(content),
+        )
+
+    def select_session_track(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_query: str,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        headers = {"Content-Type": "application/json"}
+        if self._settings.resolver_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
+        body, content = self._complete_json(
+            self._build_session_selection_messages(request, service, session, search_query, candidates),
+            headers,
+        )
+        parsed = self._parse_json_object(content)
+        selected_index = parsed.get("selected_index")
+        if not isinstance(selected_index, int):
+            selected_index = 0
+        if selected_index < 0 or selected_index >= len(candidates):
+            selected_index = 0
+        return SessionTrackSelection(
+            selected_index=selected_index,
             resolver="openai_compatible",
             raw=parsed,
             reasoning=self._extract_reasoning(body),
@@ -207,13 +250,13 @@ class OpenAICompatibleResolver:
                 "If there is an active session and the user asks for a change like 'more pop' or 'more of this artist', prefer steer_session.",
                 "If there is an active session and the new request implies a major change of activity, mood, or context, starting a new play_session is acceptable.",
                 "If there is an active session and the user says things like 'I don't like this', 'skip this', 'not this one', or otherwise rejects only the current track, prefer reject_current_track instead of changing the whole session vibe.",
-                "For play_candidate_match, provide candidate_tracks as [{'title': ..., 'artist': ...}] when possible.",
-                "For play_candidate_match, provide candidate_artists only as fallback support.",
-                "For play_candidate_match, always include candidate_queries for descriptive requests as last-resort fallback search phrases.",
-                "Do not invent fake artists or track titles. Prefer real, attributable music. If uncertain, rely more on candidate_queries.",
-                "If the user names an artist but not a specific song, do not guess a current track from memory. Prefer artist-driven live catalog selection via play_session or candidate_artists.",
+                "Positive steering like 'i like this artist', 'more like this', 'more pop', or 'more of this artist' should usually use steer_session and affect future picks rather than interrupting the current song.",
+                "Negative feedback about the current song should usually use reject_current_track and change the song now.",
+                "For play_session and steer_session, return a request string that can be persisted as session steering state.",
+                "If the user says something like 'more like this', 'more of this artist', or similar session steering, rewrite it into a concrete request using the current track and artist when possible.",
+                "Do not invent fake artists or track titles.",
                 "For play_session and steer_session, use the parameter name 'request'. Do not use 'request_text' or any alternate field names.",
-                "Bad fallback query example: 'popular songs by Pink'. Better candidate artist: 'P!nk'. Better candidate tracks might be her known singles.",
+                "For session-style playback, the session will later search the catalog and choose from real results, so focus on producing a good search/steering request.",
                 "If the user asks what is playing, use get_now_playing.",
                 "If the user asks to resume, use play. If the user asks to pause, use pause.",
             ],
@@ -226,9 +269,9 @@ class OpenAICompatibleResolver:
             "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something. "
             "Treat generic or descriptive play requests as adaptive long-form listening sessions. "
             "When a user gives negative feedback about only the currently playing song, reject just that track rather than changing the whole session. "
+            "When a user gives positive steering about the current session, preserve that as future session direction rather than interrupting the current song. "
             "You may infer a helpful music request from surrounding life context when the user is clearly asking for music help, such as cleaning, studying, waking up, or winding down. "
-            "For descriptive playback requests, propose concrete track and artist candidates rather than a literal English search phrase. "
-            "Never invent obviously fake artist or song names; if you are unsure, include candidate_queries fallback phrases."
+            "For descriptive playback requests, produce a good search or steering request rather than guessing final tracks from memory."
         )
         return [
             {"role": "system", "content": system},
@@ -247,22 +290,51 @@ class OpenAICompatibleResolver:
             "count": count,
         }
         system = (
-            "You are planning the next tracks for an adaptive music session in cider_agent. "
-            "Return only JSON with keys candidate_tracks, candidate_artists, and candidate_queries. "
-            "candidate_tracks must be a list of objects shaped like {\"title\": string, \"artist\": string}. "
-            "Use real, attributable music. Do not invent fake artist or track names. "
-            f"The session needs {count} next track candidate right now. "
-            "Keep the plan small and decisive: return at most 1 candidate_tracks entry, at most 1 candidate_artist, and exactly 1 candidate_queries fallback phrase. "
-            "Do not brainstorm large option lists or narrate multiple revisions before deciding. "
-            "Avoid repeating tracks from recent_tracks or global_recent_tracks unless truly necessary. "
+            "You are planning the next search request for an adaptive music session in cider_agent. "
+            "Return only JSON with key search_queries, containing a short list of search strings. "
+            f"The session needs {count} search query right now; return exactly 1 query when possible. "
             "Honor the original session_request, steering changes, and the current timestamp. "
+            "Treat session_steering as persistent cumulative session state, not a one-turn hint. "
+            "Negative steering must continue to apply to future selections until explicitly overridden. "
+            "Positive steering must continue to shape future selections until explicitly overridden. "
             "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
-            "If the request names an artist but not a specific song, prefer candidate_artists and let the service retrieve live catalog tracks rather than guessing exact songs from memory. "
-            "Always include at least one candidate_queries fallback phrase."
+            "Do not guess final tracks from memory here; focus on the best Apple Music search string."
         )
         return [
             {"role": "system", "content": system},
-            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nPlan the next tracks for this session."},
+            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nPlan the next search query for this session."},
+        ]
+
+    def _build_session_selection_messages(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_query: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        context = {
+            "current_timestamp": service.current_timestamp(),
+            "session_request": session.get("request_text"),
+            "session_steering": session.get("steering_history", [])[-5:],
+            "recent_tracks": service.recent_session_tracks(limit=service.session_recent_tracks_limit()),
+            "global_recent_tracks": service.recent_global_tracks(limit=service.global_recent_tracks_limit()),
+            "playback_summary": service.session_planning_playback_snapshot(session),
+            "search_query": search_query,
+            "candidates": candidates[: self.MAX_SESSION_SELECTION_CANDIDATES],
+        }
+        system = (
+            "You are choosing the next track for an adaptive music session in cider_agent from real Apple Music results. "
+            "Return only JSON with shape {\"selected_index\": number}. "
+            "Choose the single best candidate for the session request and steering. "
+            "Treat session_steering as persistent cumulative session state, not a one-turn hint. "
+            "Negative steering must continue to apply until explicitly overridden. "
+            "Positive steering must continue to apply until explicitly overridden. "
+            "Prefer candidates that fit the session direction and avoid recent repeats."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nChoose the best candidate index for the next track."},
         ]
 
     def _complete_json(self, messages: list[dict[str, str]], headers: dict[str, str]) -> tuple[dict[str, Any], str]:
@@ -425,60 +497,6 @@ class OpenAICompatibleResolver:
             subject = re.sub(r"^make me\s+", "", subject, flags=re.IGNORECASE)
             return f"{subject} music".strip() if subject else cleaned
         return cleaned
-
-    def _extract_artist_seed(self, text: str) -> str | None:
-        patterns = [
-            r"^\s*play\s+(?:some|something\s+by|music\s+by)\s+(.+?)\s*$",
-            r"^\s*more\s+of\s+(.+?)\s*$",
-            r"^\s*add\s+(?:some|something\s+by|music\s+by)\s+(.+?)\s*$",
-        ]
-        for pattern in patterns:
-            match = re.match(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            candidate = match.group(1).strip(" .,:;!?\"'")
-            candidate = re.sub(r"\s+(please|for me)$", "", candidate, flags=re.IGNORECASE).strip()
-            if candidate and not self._request_mentions_specific_track(text):
-                return candidate
-        return None
-
-    def _extract_hard_artist_constraint(self, text: str) -> str | None:
-        direct = self._extract_artist_seed(text)
-        if direct:
-            return direct
-        patterns = [
-            r"\bwith\s+(.+?)\s+vibes?\b",
-            r"\b(.+?)\s+vibes?\b",
-            r"\bin\s+the\s+style\s+of\s+(.+?)\b",
-            r"\blike\s+(.+?)\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            candidate = match.group(1).strip(" .,:;!?\"'")
-            candidate = re.sub(r"^(some|something|music)\s+", "", candidate, flags=re.IGNORECASE).strip()
-            candidate = re.sub(r"\s+(please|for me)$", "", candidate, flags=re.IGNORECASE).strip()
-            if candidate and not self._request_mentions_specific_track(candidate):
-                return candidate
-        return None
-
-    def _query_preserves_artist_constraint(self, query: str, artist: str) -> bool:
-        query_norm = self._normalize_query_text(query).casefold()
-        artist_norm = self._normalize_query_text(artist).casefold()
-        return bool(query_norm and artist_norm and artist_norm in query_norm)
-
-    def _request_mentions_specific_track(self, text: str) -> bool:
-        lowered = text.casefold()
-        markers = [
-            "song ",
-            "track ",
-            "called ",
-            "named ",
-            " titled ",
-            " title ",
-        ]
-        return any(marker in lowered for marker in markers)
 
     def _normalize_candidate_tracks(self, value: Any) -> list[dict[str, str]]:
         if not isinstance(value, list):
