@@ -97,70 +97,16 @@ def _task_to_cli_payload(task: dict[str, Any], *, original_text: str | None = No
 
 
 def _build_action_request(args: argparse.Namespace) -> tuple[str, dict[str, Any]] | None:
-    if args.command == "status":
-        return "status", {}
-    if args.command == "now-playing":
-        return "get_now_playing", {}
     if args.command == "play":
         return "play", {}
     if args.command == "pause":
         return "pause", {}
-    if args.command == "playpause":
-        return "playpause", {}
     if args.command == "stop":
         return "stop", {}
-    if args.command == "next":
-        return "next_track", {}
-    if args.command == "previous":
-        return "previous_track", {}
-    if args.command == "seek":
-        return "seek", {"position_seconds": args.position_seconds}
-    if args.command == "volume":
-        if args.volume_command == "get":
-            return "get_volume", {}
-        return "set_volume", {"volume": args.volume}
-    if args.command == "queue":
-        if args.queue_command == "show":
-            return "get_queue", {}
-        if args.queue_command == "clear":
-            return "clear_queue", {}
-        if args.queue_command == "remove":
-            return "remove_queue_item", {"index": args.index}
-        return "move_queue_item", {"from_index": args.from_index, "to_index": args.to_index}
-    if args.command == "search":
-        if args.search_command == "default":
-            return "search", {"query": args.query, "limit": args.limit, "storefront": args.storefront}
-        if args.search_command == "library":
-            return "search_library", {"query": args.query, "limit": args.limit}
-        return "search_catalog", {"query": args.query, "limit": args.limit, "storefront": args.storefront}
-    if args.command == "session":
-        if args.session_command == "status":
-            return "session_status", {}
-        if args.session_command == "stop":
-            return "stop_session", {}
-        return "refill_session", {}
-    if args.command == "playlist":
-        if args.playlist_command == "list":
-            return "list_library_playlists", {}
-        if args.playlist_command == "tracks":
-            return "get_library_playlist_tracks", {"playlist_id": args.playlist_id}
-        return None
     if args.command == "preferences":
         if args.preferences_command == "list":
             return "list_preferences", {}
-        if args.preferences_command == "remember":
-            return "remember_preference", {
-                "kind": args.kind,
-                "value": args.value,
-                "category": args.category,
-                "weight": args.weight,
-                "note": args.note,
-            }
         return "forget_preference", {"preference_id": args.preference_id}
-    if args.command == "recommend":
-        if args.play:
-            return "play_recommendation", {"query": args.query}
-        return "recommend", {"query": args.query, "limit": args.limit}
     return None
 
 
@@ -192,79 +138,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("status")
-    subparsers.add_parser("now-playing")
     subparsers.add_parser("play")
     subparsers.add_parser("pause")
-    subparsers.add_parser("playpause")
     subparsers.add_parser("stop")
-    subparsers.add_parser("next")
-    subparsers.add_parser("previous")
-
-    seek = subparsers.add_parser("seek")
-    seek.add_argument("position_seconds", type=float)
-
-    volume = subparsers.add_parser("volume")
-    volume_subparsers = volume.add_subparsers(dest="volume_command", required=True)
-    volume_subparsers.add_parser("get")
-    volume_set = volume_subparsers.add_parser("set")
-    volume_set.add_argument("volume", type=int)
-
-    queue = subparsers.add_parser("queue")
-    queue_subparsers = queue.add_subparsers(dest="queue_command", required=True)
-    queue_subparsers.add_parser("show")
-    queue_subparsers.add_parser("clear")
-    queue_remove = queue_subparsers.add_parser("remove")
-    queue_remove.add_argument("index", type=int)
-    queue_move = queue_subparsers.add_parser("move")
-    queue_move.add_argument("from_index", type=int)
-    queue_move.add_argument("to_index", type=int)
-
-    search = subparsers.add_parser("search")
-    search_subparsers = search.add_subparsers(dest="search_command", required=True)
-    search_default = search_subparsers.add_parser("default")
-    search_default.add_argument("query")
-    search_default.add_argument("--limit", type=int, default=10)
-    search_default.add_argument("--storefront", default="us")
-    search_library = search_subparsers.add_parser("library")
-    search_library.add_argument("query")
-    search_library.add_argument("--limit", type=int, default=10)
-    search_catalog = search_subparsers.add_parser("catalog")
-    search_catalog.add_argument("query")
-    search_catalog.add_argument("--limit", type=int, default=10)
-    search_catalog.add_argument("--storefront", default="us")
 
     ask = subparsers.add_parser("ask")
     ask.add_argument("text")
 
-    session = subparsers.add_parser("session")
-    session_subparsers = session.add_subparsers(dest="session_command", required=True)
-    session_subparsers.add_parser("status")
-    session_subparsers.add_parser("stop")
-    session_subparsers.add_parser("refill")
-
-    playlist = subparsers.add_parser("playlist")
-    playlist_subparsers = playlist.add_subparsers(dest="playlist_command", required=True)
-    playlist_subparsers.add_parser("list")
-    playlist_show = playlist_subparsers.add_parser("tracks")
-    playlist_show.add_argument("playlist_id")
-
     preferences = subparsers.add_parser("preferences")
     preferences_subparsers = preferences.add_subparsers(dest="preferences_command", required=True)
     preferences_subparsers.add_parser("list")
-    pref_remember = preferences_subparsers.add_parser("remember")
-    pref_remember.add_argument("kind", choices=["like", "dislike"])
-    pref_remember.add_argument("value")
-    pref_remember.add_argument("--category")
-    pref_remember.add_argument("--weight", type=float, default=1.0)
-    pref_remember.add_argument("--note")
     pref_forget = preferences_subparsers.add_parser("forget")
     pref_forget.add_argument("preference_id", type=int)
-
-    recommend = subparsers.add_parser("recommend")
-    recommend.add_argument("--query")
-    recommend.add_argument("--limit", type=int, default=5)
-    recommend.add_argument("--play", action="store_true")
 
     serve = subparsers.add_parser("serve")
     serve.add_argument("--host")
@@ -293,77 +178,19 @@ def main() -> None:
             payload = _run_via_local_server(args)
         except ConnectionError:
             service = get_service()
-            if args.command == "status":
-                payload = service.status()
-            elif args.command == "now-playing":
-                payload = service.get_now_playing()
-            elif args.command == "play":
+            if args.command == "play":
                 payload = service.play()
             elif args.command == "pause":
                 payload = service.pause()
-            elif args.command == "playpause":
-                payload = service.playpause()
             elif args.command == "stop":
                 payload = service.stop()
-            elif args.command == "next":
-                payload = service.next_track()
-            elif args.command == "previous":
-                payload = service.previous_track()
-            elif args.command == "seek":
-                payload = service.seek(args.position_seconds)
-            elif args.command == "volume":
-                if args.volume_command == "get":
-                    payload = service.get_volume()
-                else:
-                    payload = service.set_volume(args.volume)
-            elif args.command == "queue":
-                if args.queue_command == "show":
-                    payload = service.get_queue()
-                elif args.queue_command == "clear":
-                    payload = service.clear_queue()
-                elif args.queue_command == "remove":
-                    payload = service.remove_queue_item(args.index)
-                else:
-                    payload = service.move_queue_item(args.from_index, args.to_index)
-            elif args.command == "search":
-                if args.search_command == "default":
-                    payload = service.search(args.query, limit=args.limit, storefront=args.storefront)
-                elif args.search_command == "library":
-                    payload = service.search_library(args.query, limit=args.limit)
-                else:
-                    payload = service.search_catalog(args.query, limit=args.limit, storefront=args.storefront)
             elif args.command == "ask":
                 payload = service.handle_text_request(args.text)
-            elif args.command == "session":
-                if args.session_command == "status":
-                    payload = service.session_status()
-                elif args.session_command == "stop":
-                    payload = service.stop_session()
-                else:
-                    payload = service.refill_active_session()
-            elif args.command == "playlist":
-                if args.playlist_command == "list":
-                    payload = service.list_library_playlists()
-                else:
-                    payload = service.get_library_playlist_tracks(args.playlist_id)
             elif args.command == "preferences":
                 if args.preferences_command == "list":
                     payload = service.list_preferences()
-                elif args.preferences_command == "remember":
-                    payload = service.remember_preference(
-                        kind=args.kind,
-                        value=args.value,
-                        category=args.category,
-                        weight=args.weight,
-                        note=args.note,
-                    )
                 else:
                     payload = service.forget_preference(args.preference_id)
-            elif args.command == "recommend":
-                if args.play:
-                    payload = service.play_recommendation(query=args.query)
-                else:
-                    payload = service.recommend(query=args.query, limit=args.limit)
             else:  # pragma: no cover - argparse enforces commands
                 raise RuntimeError(f"Unhandled command: {args.command}")
     except TextRequestExecutionError as exc:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
-from dataclasses import dataclass
 import json
 import random
 import threading
@@ -14,7 +13,7 @@ from urllib.parse import quote
 import re
 
 from .config import Settings
-from .action_registry import get_action_definition, list_action_definitions
+from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
 from .results import EngineActionResult, TextRequestResult
 from .resolver import ResolvedAction, Resolver, SessionQueryPlan, SessionTrackSelection, build_resolver
@@ -125,83 +124,6 @@ def _clean_id(value: Any) -> str:
     return "" if cleaned.lower() == "none" else cleaned
 
 
-@dataclass
-class RecommendationResult:
-    """Normalized recommendation result."""
-
-    strategy: str
-    reason: str
-    source: str
-    items: list[dict[str, Any]]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "strategy": self.strategy,
-            "reason": self.reason,
-            "source": self.source,
-            "count": len(self.items),
-            "items": self.items,
-        }
-
-
-class DeterministicRecommender:
-    """Use explicit preferences and available library/catalog search to rank tracks."""
-
-    def recommend(
-        self,
-        *,
-        service: "CiderAgentService",
-        query: str | None = None,
-        limit: int = 5,
-        prefer_library: bool | None = None,
-    ) -> RecommendationResult:
-        preferences = service.list_preferences()["preferences"]
-        positive = [item for item in preferences if item["kind"] == "like"]
-        negative_values = {item["value"].strip().lower() for item in preferences if item["kind"] == "dislike"}
-
-        search_terms: list[str] = []
-        if query:
-            search_terms.append(query)
-        for item in positive:
-            value = str(item["value"]).strip()
-            if value and value not in search_terms:
-                search_terms.append(value)
-        if not search_terms:
-            raise CiderValidationError("No explicit preferences are stored yet.")
-
-        if prefer_library is None:
-            prefer_library = service.default_search_source() == "library"
-        source = "library" if prefer_library else "catalog"
-        chosen_items: list[dict[str, Any]] = []
-        for term in search_terms:
-            if prefer_library:
-                results = service.search_library_tracks(term, limit=limit)
-                candidates = results["tracks"]
-            else:
-                results = service.search_catalog_tracks(term, limit=limit)
-                candidates = results["tracks"]
-            filtered = [
-                item
-                for item in candidates
-                if str(item.get("title", "")).strip().lower() not in negative_values
-                and str(item.get("artist", "")).strip().lower() not in negative_values
-            ]
-            chosen_items.extend(filtered)
-            if chosen_items:
-                break
-
-        if not chosen_items and prefer_library:
-            return self.recommend(service=service, query=query, limit=limit, prefer_library=False)
-        if not chosen_items:
-            raise CiderValidationError("No recommendation candidates matched the stored preferences.")
-        return RecommendationResult(
-            strategy="deterministic-explicit-preferences",
-            reason=f"Matched {len(search_terms)} stored or requested preference terms.",
-            source=source,
-            items=chosen_items[:limit],
-        )
-
-
 class CiderAgentService:
     """High-level operations for the Cider agent."""
 
@@ -211,6 +133,9 @@ class CiderAgentService:
     SESSION_SEARCH_RESULT_LIMIT = 100
     SESSION_SEARCH_PAGE_LIMIT = 50
     SESSION_SELECTION_WINDOW_SIZE = 6
+    PREFERENCE_SEED_SEARCH_LIMIT = 6
+    PREFERENCE_SEED_ARTIST_CAP = 4
+    PREFERENCE_SEED_POOL_QUERY = "__preference_seeded__"
 
     def __init__(
         self,
@@ -218,13 +143,11 @@ class CiderAgentService:
         *,
         rpc_client: CiderRpcClient | None = None,
         preference_store: PreferenceStore | None = None,
-        recommender: DeterministicRecommender | None = None,
         resolver: Resolver | None = None,
     ) -> None:
         self._settings = settings
         self._rpc = rpc_client or CiderRpcClient(settings)
         self._preferences = preference_store or PreferenceStore(settings.database_path)
-        self._recommender = recommender or DeterministicRecommender()
         self._resolver = resolver or build_resolver(settings)
         self._session_worker_thread: threading.Thread | None = None
         self._session_worker_stop = threading.Event()
@@ -235,6 +158,13 @@ class CiderAgentService:
         self._session_runtime: dict[int, dict[str, Any]] = {}
         self._session_advance_lock = threading.Lock()
         self._random = random.SystemRandom()
+        self._debug_candidate_track_search_count = 0
+        self._debug_candidate_track_search_ms = 0.0
+        self._debug_candidate_artist_search_count = 0
+        self._debug_candidate_artist_search_ms = 0.0
+        self._debug_candidate_query_search_count = 0
+        self._debug_candidate_query_search_ms = 0.0
+        self._debug_selection_candidate_count = 0
         self.reconcile_session_runtime()
 
     def close(self) -> None:
@@ -265,7 +195,12 @@ class CiderAgentService:
     def current_timestamp(self) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
 
-    def list_action_definitions(self, *, text_exposable_only: bool = False) -> list[dict[str, Any]]:
+    def list_action_definitions(self, *, text_exposable_only: bool = False, public_only: bool = True) -> list[dict[str, Any]]:
+        definitions_source = (
+            list_public_action_definitions()
+            if public_only and not text_exposable_only
+            else list_action_definitions(text_exposable_only=text_exposable_only)
+        )
         return [
             {
                 "name": definition.name,
@@ -275,11 +210,12 @@ class CiderAgentService:
                 "required_fields": list(definition.required_fields),
                 "read_only": definition.read_only,
                 "text_exposable": definition.text_exposable,
+                "public_exposed": definition.public_exposed,
                 "session_aware": definition.session_aware,
                 "deferred_a2a_eligible": definition.deferred_a2a_eligible,
                 "advanced_only": definition.advanced_only,
             }
-            for definition in list_action_definitions(text_exposable_only=text_exposable_only)
+            for definition in definitions_source
         ]
 
     def reconcile_session_runtime(self) -> None:
@@ -460,11 +396,6 @@ class CiderAgentService:
 
     def previous_track(self) -> dict[str, Any]:
         return {"status": "ok", "result": self._rpc.playback_post("/previous")}
-
-    def seek(self, position_seconds: float) -> dict[str, Any]:
-        if position_seconds < 0:
-            raise CiderValidationError("position_seconds must be non-negative.")
-        return {"status": "ok", "result": self._rpc.playback_post("/seek", {"position": position_seconds})}
 
     def get_volume(self) -> dict[str, Any]:
         return {"status": "ok", "volume": self._rpc.playback_get("/volume")}
@@ -671,6 +602,27 @@ class CiderAgentService:
             "raw": payload,
         }
 
+    def play_library_playlist(self, playlist_name: str) -> dict[str, Any]:
+        if not playlist_name.strip():
+            raise CiderValidationError("playlist_name cannot be empty.")
+        exact_results = self.search_library_playlists(playlist_name, limit=10)
+        playlists = list(exact_results.get("playlists", []))
+        if not playlists:
+            playlists = list(self.list_library_playlists(limit=50).get("playlists", []))
+        match = self._best_playlist_match(playlists, playlist_name=playlist_name)
+        if match is None:
+            raise CiderValidationError(f"No library playlist matched: {playlist_name}")
+        playlist_id = str(match.get("id", "")).strip()
+        playlist_type = str(match.get("type", "library-playlists")).strip() or "library-playlists"
+        if not playlist_id:
+            raise CiderValidationError("Matched playlist did not include a playable id.")
+        playback = self.play_item(playlist_id, kind=playlist_type, is_library=True)
+        return {
+            "status": "ok",
+            "playlist": match,
+            "playback": playback,
+        }
+
     def list_recently_played(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
         self._validate_limit_offset(limit, offset)
         path = f"/v1/me/recent/played/tracks?limit={limit}"
@@ -716,32 +668,24 @@ class CiderAgentService:
             raise CiderValidationError("Selected search result did not include a playable id.")
         return self.play_item(item_id, kind=kind, is_library=is_library)
 
-    def remember_preference(
-        self,
-        *,
-        kind: str,
-        value: str,
-        category: str | None = None,
-        weight: float = 1.0,
-        note: str | None = None,
-    ) -> dict[str, Any]:
-        normalized_kind = kind.strip().lower()
-        if normalized_kind not in {"like", "dislike"}:
-            raise CiderValidationError("kind must be 'like' or 'dislike'.")
-        if not value.strip():
-            raise CiderValidationError("value cannot be empty.")
-        preference = self._preferences.remember_preference(
-            kind=normalized_kind,
-            category=category.strip() if category else None,
-            value=value.strip(),
-            weight=weight,
-            note=note.strip() if note else None,
-        )
-        return {"status": "ok", "preference": preference}
-
     def list_preferences(self) -> dict[str, Any]:
         preferences = self._preferences.list_preferences()
-        return {"status": "ok", "count": len(preferences), "preferences": preferences}
+        liked_tracks = [item for item in preferences if item.get("preference_type") == "liked_track"]
+        favored_artists = [item for item in preferences if item.get("preference_type") == "favored_artist"]
+        rejected_tracks = [item for item in preferences if item.get("preference_type") == "globally_rejected_track"]
+        return {
+            "status": "ok",
+            "count": len(preferences),
+            "summary": {
+                "liked_tracks": len(liked_tracks),
+                "favored_artists": len(favored_artists),
+                "globally_rejected_tracks": len(rejected_tracks),
+            },
+            "liked_tracks": liked_tracks,
+            "favored_artists": favored_artists,
+            "globally_rejected_tracks": rejected_tracks,
+            "preferences": preferences,
+        }
 
     def forget_preference(self, preference_id: int) -> dict[str, Any]:
         removed = self._preferences.delete_preference(preference_id)
@@ -749,26 +693,52 @@ class CiderAgentService:
             raise CiderValidationError(f"Preference {preference_id} was not found.")
         return {"status": "ok", "removed": True, "preference_id": preference_id}
 
-    def recommend(self, *, query: str | None = None, limit: int = 5) -> dict[str, Any]:
-        if limit <= 0 or limit > 50:
-            raise CiderValidationError("limit must be between 1 and 50.")
-        recommendation = self._recommender.recommend(service=self, query=query, limit=limit, prefer_library=None)
-        return {"status": "ok", "recommendation": recommendation.as_dict()}
-
-    def play_recommendation(self, *, query: str | None = None) -> dict[str, Any]:
-        recommendation = self._recommender.recommend(service=self, query=query, limit=1, prefer_library=None)
-        item = recommendation.items[0]
-        play_params = item.get("play_params", {})
-        item_id = str(play_params.get("id", "")).strip()
-        kind = str(play_params.get("kind", "songs")).strip() or "songs"
-        is_library = bool(play_params.get("is_library", recommendation.source == "library"))
-        if not item_id:
-            raise CiderValidationError("Recommended item did not include a playable id.")
-        play_result = self.play_item(item_id, kind=kind, is_library=is_library)
+    def like_current_track(self) -> dict[str, Any]:
+        playback = self.playback_snapshot()
+        current = playback.get("track", {})
+        current_id = _clean_id(current.get("track_id"))
+        if not current_id:
+            raise CiderValidationError("No current track is available to like.")
+        session = self._preferences.get_active_session()
+        runtime = self._get_session_runtime(session["id"]) if session is not None else {}
+        liked_track = self._preferences.record_liked_track(
+            track_id=current_id,
+            title=str(current.get("title", "")).strip() or None,
+            artist_name=str(current.get("artist", "")).strip() or None,
+            album=str(current.get("album", "")).strip() or None,
+            item_kind=str(current.get("kind", "")).strip() or None,
+            is_library=bool(current.get("is_library")) if current.get("is_library") is not None else None,
+            session_request_text=str(session.get("request_text", "")).strip() or None if session is not None else None,
+            session_search_query=self._current_preference_context_query(runtime),
+        )
+        favored_artist = None
+        if str(current.get("artist", "")).strip():
+            favored_artist = self._preferences.record_favored_artist(
+                artist_name=str(current.get("artist", "")).strip(),
+                session_request_text=liked_track.get("session_request_text"),
+                session_search_query=liked_track.get("session_search_query"),
+            )
+        if session is not None:
+            self._preferences.add_session_event(
+                session["id"],
+                event_type="track_liked",
+                track={
+                    "track_id": current_id,
+                    "title": current.get("title"),
+                    "artist": current.get("artist"),
+                    "album": current.get("album"),
+                    "href": None,
+                },
+                metadata={
+                    "session_request_text": liked_track.get("session_request_text"),
+                    "session_search_query": liked_track.get("session_search_query"),
+                },
+            )
         return {
             "status": "ok",
-            "recommendation": recommendation.as_dict(),
-            "playback": play_result,
+            "playback_continues": True,
+            "liked_track": liked_track,
+            "favored_artist": favored_artist,
         }
 
     def session_status(self, *, include_recent_tracks: bool = True, compact: bool | None = None) -> dict[str, Any]:
@@ -894,12 +864,28 @@ class CiderAgentService:
         }
 
     def reject_current_track(self) -> dict[str, Any]:
-        session = self._preferences.get_active_session()
-        if session is None:
-            raise CiderValidationError("No active session is running.")
         playback = self.playback_snapshot()
         current = playback.get("track", {})
         current_id = _clean_id(current.get("track_id"))
+        if not current_id:
+            raise CiderValidationError("No current track is available to reject.")
+        self._preferences.record_global_rejected_track(
+            track_id=current_id,
+            title=str(current.get("title", "")).strip() or None,
+            artist_name=str(current.get("artist", "")).strip() or None,
+            album=str(current.get("album", "")).strip() or None,
+            item_kind=str(current.get("kind", "")).strip() or None,
+            is_library=bool(current.get("is_library")) if current.get("is_library") is not None else None,
+        )
+        session = self._preferences.get_active_session()
+        if session is None:
+            native = {"status": "ok", "result": self._rpc.playback_post("/next")}
+            return {
+                "status": "ok",
+                "mode": "playback",
+                "rejected_track_id": current_id,
+                "result": native,
+            }
         if current_id:
             self._mark_session_track_rejected(session["id"], current_id)
             self._preferences.add_session_event(
@@ -1115,7 +1101,7 @@ class CiderAgentService:
                 timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
                 collect_started_at = time.perf_counter()
                 tracks, search_query, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
-                if not tracks and getattr(plan, "resolver", "") == "session-runtime":
+                if not tracks and getattr(plan, "resolver", "") != "preference-seeded":
                     replan_started_at = time.perf_counter()
                     plan = self._plan_session_query(session, count=1, force_replan=True)
                     timings["replan_session_ms"] = _elapsed_ms(replan_started_at)
@@ -1180,6 +1166,11 @@ class CiderAgentService:
         if active_queries and not force_replan:
             self._ensure_session_query_pools(session, active_queries)
             return SessionQueryPlan(search_queries=active_queries[:count] or active_queries, resolver="session-runtime")
+        if self._is_vague_play_request(session.get("request_text")):
+            seeded_queries = self._bootstrap_preference_seeded_session(session)
+            if seeded_queries:
+                self._set_session_runtime(session["id"], active_search_queries=seeded_queries)
+                return SessionQueryPlan(search_queries=seeded_queries[:count] or seeded_queries, resolver="preference-seeded")
         planner = getattr(self._resolver, "plan_session", None)
         if not callable(planner):
             raise CiderValidationError("The configured resolver does not support adaptive play sessions.")
@@ -1371,7 +1362,7 @@ class CiderAgentService:
         return normalized
 
     def _session_query_pool_build_excluded_ids(self) -> set[str]:
-        excluded: set[str] = set()
+        excluded = set(self._preferences.globally_rejected_track_ids())
         for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit()):
             track_id = _clean_id(track.get("track_id"))
             if track_id:
@@ -1380,17 +1371,250 @@ class CiderAgentService:
 
     def _build_session_query_pool(self, session: dict[str, Any], search_query: str) -> dict[str, Any]:
         raw_tracks = self._fetch_session_search_results(search_query)
-        build_excluded_ids = self._session_query_pool_build_excluded_ids()
-        cached_tracks = self._filter_session_search_candidates(raw_tracks, build_excluded_ids)
+        global_rejected_ids = self._preferences.globally_rejected_track_ids()
+        recent_track_ids = {
+            _clean_id(track.get("track_id"))
+            for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit())
+            if _clean_id(track.get("track_id"))
+        }
+        cached_tracks = self._filter_session_search_candidates(raw_tracks, recent_track_ids | global_rejected_ids)
         # Global recent history should influence pool creation, but it should not
         # dead-end a brand-new pool when real results exist.
-        if not cached_tracks and raw_tracks and build_excluded_ids:
-            cached_tracks = self._filter_session_search_candidates(raw_tracks, set())
+        if not cached_tracks and raw_tracks and recent_track_ids:
+            cached_tracks = self._filter_session_search_candidates(raw_tracks, global_rejected_ids)
         return {
             "search_query": search_query,
             "cursor": 0,
             "entries": [{"track": track, "state": "fresh"} for track in cached_tracks],
         }
+
+    def _bootstrap_preference_seeded_session(self, session: dict[str, Any]) -> list[str]:
+        cues = self._preference_seed_cues()
+        artists = self._preferences.favored_artists()
+        liked_tracks = self._preferences.liked_tracks()
+        if not cues and not artists and not liked_tracks:
+            return []
+
+        merged_tracks: list[dict[str, Any]] = []
+        seen_track_ids: set[str] = set()
+        artist_counts: dict[str, int] = {}
+        rejected_ids = self._session_query_pool_build_excluded_ids()
+
+        for seed in cues:
+            results = self._fetch_preference_seed_results(seed["query"])
+            if not results:
+                self._add_preference_seed_fallback_track(
+                    merged_tracks,
+                    seen_track_ids=seen_track_ids,
+                    artist_counts=artist_counts,
+                    preference=seed["fallback"],
+                    rejected_ids=rejected_ids,
+                    seed_query=seed["query"],
+                )
+                continue
+            added = self._add_preference_seed_track_batch(
+                merged_tracks,
+                seen_track_ids=seen_track_ids,
+                artist_counts=artist_counts,
+                tracks=results,
+                rejected_ids=rejected_ids,
+                limit=3,
+                seed_query=seed["query"],
+            )
+            if added == 0:
+                self._add_preference_seed_fallback_track(
+                    merged_tracks,
+                    seen_track_ids=seen_track_ids,
+                    artist_counts=artist_counts,
+                    preference=seed["fallback"],
+                    rejected_ids=rejected_ids,
+                    seed_query=seed["query"],
+                )
+
+        for artist in artists:
+            query = str(artist.get("artist_name", "")).strip()
+            if not query:
+                continue
+            results = self._fetch_preference_seed_results(query)
+            self._add_preference_seed_track_batch(
+                merged_tracks,
+                seen_track_ids=seen_track_ids,
+                artist_counts=artist_counts,
+                tracks=results,
+                rejected_ids=rejected_ids,
+                limit=2,
+                seed_query=query,
+            )
+
+        for liked_track in liked_tracks:
+            fallback_track = self._stored_preference_to_track(liked_track)
+            self._add_preference_seed_track(
+                merged_tracks,
+                seen_track_ids=seen_track_ids,
+                artist_counts=artist_counts,
+                track=fallback_track,
+                rejected_ids=rejected_ids,
+                limit=1,
+                seed_query=str(liked_track.get("session_search_query") or liked_track.get("title") or "").strip(),
+            )
+
+        if not merged_tracks:
+            return []
+        self._random.shuffle(merged_tracks)
+        self._set_session_runtime(
+            session["id"],
+            query_pools={
+                self.PREFERENCE_SEED_POOL_QUERY: {
+                    "search_query": self.PREFERENCE_SEED_POOL_QUERY,
+                    "cursor": 0,
+                    "entries": [{"track": track, "state": "fresh"} for track in merged_tracks],
+                }
+            },
+            active_search_queries=[self.PREFERENCE_SEED_POOL_QUERY],
+        )
+        return [self.PREFERENCE_SEED_POOL_QUERY]
+
+    def _preference_seed_cues(self) -> list[dict[str, Any]]:
+        cues: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for liked_track in self._preferences.liked_tracks():
+            for candidate in (liked_track.get("session_search_query"), liked_track.get("session_request_text")):
+                query = str(candidate or "").strip()
+                if not query:
+                    continue
+                key = query.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cues.append({"query": query, "fallback": liked_track})
+                break
+        return cues
+
+    def _fetch_preference_seed_results(self, query: str) -> list[dict[str, Any]]:
+        query_text = str(query).strip()
+        if not query_text:
+            return []
+        search_started_at = time.perf_counter()
+        results = self.search_catalog_tracks(query_text, limit=self.PREFERENCE_SEED_SEARCH_LIMIT)
+        self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
+        self._debug_candidate_query_search_count += 1
+        return list(results.get("tracks", []))
+
+    def _stored_preference_to_track(self, preference: dict[str, Any]) -> dict[str, Any]:
+        track_id = _clean_id(preference.get("track_id"))
+        return {
+            "id": track_id,
+            "title": preference.get("title"),
+            "artist": preference.get("artist_name"),
+            "album": preference.get("album"),
+            "play_params": {
+                "id": track_id,
+                "kind": preference.get("item_kind") or "songs",
+                "is_library": bool(preference.get("is_library")),
+            },
+        }
+
+    def _add_preference_seed_track_batch(
+        self,
+        merged_tracks: list[dict[str, Any]],
+        *,
+        seen_track_ids: set[str],
+        artist_counts: dict[str, int],
+        tracks: list[dict[str, Any]],
+        rejected_ids: set[str],
+        limit: int,
+        seed_query: str,
+    ) -> int:
+        added = 0
+        for track in tracks:
+            if self._add_preference_seed_track(
+                merged_tracks,
+                seen_track_ids=seen_track_ids,
+                artist_counts=artist_counts,
+                track=track,
+                rejected_ids=rejected_ids,
+                limit=limit,
+                seed_query=seed_query,
+                added=added,
+            ):
+                added += 1
+            if added >= limit:
+                return added
+        return added
+
+    def _add_preference_seed_fallback_track(
+        self,
+        merged_tracks: list[dict[str, Any]],
+        *,
+        seen_track_ids: set[str],
+        artist_counts: dict[str, int],
+        preference: dict[str, Any],
+        rejected_ids: set[str],
+        seed_query: str,
+    ) -> None:
+        global_rejected_ids = self._preferences.globally_rejected_track_ids()
+        self._add_preference_seed_track(
+            merged_tracks,
+            seen_track_ids=seen_track_ids,
+            artist_counts=artist_counts,
+            track=self._stored_preference_to_track(preference),
+            rejected_ids=global_rejected_ids,
+            limit=1,
+            seed_query=seed_query,
+        )
+
+    def _add_preference_seed_track(
+        self,
+        merged_tracks: list[dict[str, Any]],
+        *,
+        seen_track_ids: set[str],
+        artist_counts: dict[str, int],
+        track: dict[str, Any],
+        rejected_ids: set[str],
+        limit: int,
+        seed_query: str,
+        added: int = 0,
+    ) -> bool:
+        if added >= limit:
+            return False
+        track_id = _clean_id(track.get("id")) or _clean_id(track.get("play_params", {}).get("id"))
+        if not track_id or track_id in rejected_ids or track_id in seen_track_ids:
+            return False
+        artist_key = _normalize_match_text(track.get("artist"))
+        if artist_key and artist_counts.get(artist_key, 0) >= self.PREFERENCE_SEED_ARTIST_CAP:
+            return False
+        normalized_track = dict(track)
+        normalized_track["_seed_query"] = seed_query
+        merged_tracks.append(normalized_track)
+        seen_track_ids.add(track_id)
+        if artist_key:
+            artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+        return True
+
+    def _is_vague_play_request(self, value: Any) -> bool:
+        text = str(value or "").strip().casefold()
+        if not text:
+            return False
+        compact = re.sub(r"[^a-z0-9]+", " ", text)
+        compact = " ".join(compact.split())
+        vague_patterns = {
+            "play music",
+            "play some music",
+            "play some songs",
+            "play something",
+            "play something good",
+            "play anything",
+            "some music",
+            "music please",
+        }
+        return compact in vague_patterns
+
+    def _current_preference_context_query(self, runtime: dict[str, Any]) -> str | None:
+        for key in ("current_seed_query", "current_pool_query"):
+            value = str(runtime.get(key, "")).strip()
+            if value and value != self.PREFERENCE_SEED_POOL_QUERY:
+                return value
+        return None
 
     def _fetch_session_search_results(self, search_query: str) -> list[dict[str, Any]]:
         tracks: list[dict[str, Any]] = []
@@ -1513,6 +1737,7 @@ class CiderAgentService:
             self._set_session_runtime(
                 session_id,
                 current_pool_query=search_query,
+                current_seed_query=str(selected_track.get("_seed_query", "")).strip() or search_query,
                 current_track_id=_clean_id(selected_track.get("id")) or _clean_id(selected_track.get("play_params", {}).get("id")),
             )
         last_index = window[-1]["index"]
@@ -1838,6 +2063,19 @@ class CiderAgentService:
         matches = self._best_artist_track_matches(tracks, artist=artist, limit=1)
         return matches[0] if matches else None
 
+    def _best_playlist_match(self, playlists: list[dict[str, Any]], *, playlist_name: str) -> dict[str, Any] | None:
+        target = _normalize_match_text(playlist_name)
+        if not target:
+            return None
+        for playlist in playlists:
+            if _normalize_match_text(playlist.get("name")) == target:
+                return playlist
+        for playlist in playlists:
+            name = _normalize_match_text(playlist.get("name"))
+            if target in name or name in target:
+                return playlist
+        return None
+
     def _best_artist_track_matches(self, tracks: list[dict[str, Any]], *, artist: str, limit: int) -> list[dict[str, Any]]:
         artist_norm = _normalize_match_text(artist)
         exact_artist_tracks = [track for track in tracks if _normalize_match_text(track.get("artist")) == artist_norm]
@@ -2000,7 +2238,14 @@ class CiderAgentService:
                 primary = payload.get("primary_track")
                 if isinstance(primary, dict) and primary.get("title") and primary.get("artist"):
                     return f"playing {primary['title']} by {primary['artist']}"
+            if result.get("rejected_track_id"):
+                return "rejected current track and skipped ahead"
             return "session advanced"
+        if action == "like_current_track":
+            liked_track = result.get("liked_track", {})
+            if isinstance(liked_track, dict) and liked_track.get("title") and liked_track.get("artist_name"):
+                return f"saved {liked_track['title']} by {liked_track['artist_name']}"
+            return "saved current track preference"
         if action == "steer_session":
             payload = result.get("result", result)
             if isinstance(payload, dict):
@@ -2016,6 +2261,14 @@ class CiderAgentService:
             track = result.get("track", {})
             if isinstance(track, dict) and track.get("title") and track.get("artist"):
                 return f"now playing {track['title']} by {track['artist']}"
+        if action == "list_library_playlists":
+            count = result.get("count")
+            if count is not None:
+                return f"found {count} playlists"
+        if action == "play_library_playlist":
+            playlist = result.get("playlist", {})
+            if isinstance(playlist, dict) and playlist.get("name"):
+                return f"playing playlist {playlist['name']}"
         if action in {"search", "search_catalog", "search_library", "search_catalog_tracks", "search_library_tracks"}:
             count = result.get("count")
             query = result.get("query")

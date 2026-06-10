@@ -329,6 +329,14 @@ class StubResolver:
                 },
                 resolver="stub",
             )
+        if "list playlists" in normalized or "what playlists" in normalized:
+            return ResolvedAction(action="list_library_playlists", parameters={}, resolver="stub")
+        if "play playlist" in normalized:
+            return ResolvedAction(action="play_library_playlist", parameters={"playlist_name": text.split("play playlist", 1)[-1].strip()}, resolver="stub")
+        if "i like this track" in normalized or "i like this song" in normalized:
+            return ResolvedAction(action="like_current_track", parameters={}, resolver="stub")
+        if normalized in {"play some music", "play music", "play something"}:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
         if "upbeat" in normalized or "morning" in normalized:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
         if "more pop" in normalized:

@@ -11,21 +11,33 @@ from cider_agent.storage import PreferenceStore
 
 
 def test_preferences_round_trip(service) -> None:
-    remembered = service.remember_preference(kind="like", value="k-pop", category="genre")
+    service.play_session("play upbeat music")
+    remembered = service.like_current_track()
     listed = service.list_preferences()
 
-    assert remembered["preference"]["value"] == "k-pop"
-    assert listed["count"] == 1
+    assert remembered["liked_track"]["title"] == "Liked Song"
+    assert remembered["favored_artist"]["artist_name"] == "Favorite Artist"
+    assert listed["count"] == 2
+    assert listed["summary"] == {
+        "liked_tracks": 1,
+        "favored_artists": 1,
+        "globally_rejected_tracks": 0,
+    }
+    assert len(listed["liked_tracks"]) == 1
+    assert len(listed["favored_artists"]) == 1
+    assert listed["globally_rejected_tracks"] == []
 
 
-def test_recommendation_uses_preferences(service) -> None:
-    service.remember_preference(kind="like", value="k-pop", category="genre")
+def test_like_current_track_saves_session_context_without_interrupting_playback(service) -> None:
+    service.play_session("play upbeat music")
 
-    result = service.recommend()
+    result = service.like_current_track()
 
     assert result["status"] == "ok"
-    assert result["recommendation"]["items"][0]["play_params"]["id"] == "catalog-track-1"
-    assert result["recommendation"]["source"] == "catalog"
+    assert result["playback_continues"] is True
+    assert result["liked_track"]["track_id"] == "catalog-track-favorite"
+    assert result["liked_track"]["session_request_text"] == "play upbeat music"
+    assert result["liked_track"]["session_search_query"] == "Favorite Artist Liked Song"
 
 
 def test_run_action_dispatches_search(service) -> None:
@@ -35,13 +47,29 @@ def test_run_action_dispatches_search(service) -> None:
     assert result["result"]["count"] == 1
 
 
+def test_can_list_library_playlists(service) -> None:
+    result = service.list_library_playlists()
+
+    assert result["status"] == "ok"
+    assert result["count"] == 1
+    assert result["playlists"][0]["name"] == "Mix"
+
+
+def test_can_play_library_playlist_by_name(service) -> None:
+    result = service.play_library_playlist("Mix")
+
+    assert result["status"] == "ok"
+    assert result["playlist"]["name"] == "Mix"
+    assert service._rpc.posts[-1]["path"] == "/play-item"
+    assert service._rpc.posts[-1]["body"] == {"id": "playlist-1", "type": "library-playlists", "isLibrary": True}
+
+
 def test_action_registry_defines_exported_actions(service) -> None:
     definitions = {item["name"]: item for item in service.list_action_definitions()}
 
-    assert "status" in definitions
-    assert "play_session" in definitions
-    assert definitions["status"]["read_only"] is True
-    assert definitions["play_session"]["session_aware"] is True
+    assert set(definitions) == {"play", "pause", "stop", "list_preferences", "forget_preference"}
+    assert definitions["list_preferences"]["read_only"] is True
+    assert definitions["play"]["public_exposed"] is True
     assert get_action_definition("search_library_tracks") is not None
 
 
@@ -397,6 +425,73 @@ def test_reject_current_track_advances_active_session_without_changing_vibe(serv
 
     assert result["status"] == "ok"
     assert result["result"]["selection_strategy"] == "adaptive-session-reject-current"
+    assert result["result"]["tracks"][0]["title"] == "Another Song"
+    rejected = service._preferences.globally_rejected_tracks()
+    assert rejected[0]["track_id"] == "catalog-track-favorite"
+
+
+def test_reject_current_track_without_session_creates_global_reject_and_skips(service) -> None:
+    result = service.reject_current_track()
+
+    assert result["status"] == "ok"
+    assert result["mode"] == "playback"
+    assert result["rejected_track_id"] == "track-1"
+    assert service._rpc.posts[-1]["path"] == "/next"
+    listed = service.list_preferences()
+    assert listed["summary"]["globally_rejected_tracks"] == 1
+    assert listed["globally_rejected_tracks"][0]["track_id"] == "track-1"
+
+
+def test_vague_session_bootstraps_from_saved_preferences(service) -> None:
+    service.play_session("play upbeat music")
+    service.like_current_track()
+    service.stop_session()
+
+    result = service.play_session("play some music")
+
+    assert result["result"]["plan"]["search_queries"] == ["__preference_seeded__"]
+    runtime = service._get_session_runtime(result["session"]["id"])
+    pool = runtime["query_pools"]["__preference_seeded__"]
+    assert pool["entries"]
+    assert any(entry["track"].get("_seed_query") == "Favorite Artist Liked Song" for entry in pool["entries"])
+
+
+def test_preference_seeded_session_falls_back_to_direct_liked_track_when_search_returns_nothing(settings, service, tmp_path) -> None:
+    class EmptySearchRpc(service._rpc.__class__):
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+            return {"data": {"results": {"songs": {"data": []}}}}
+
+    seed_service = CiderAgentService(
+        settings,
+        rpc_client=EmptySearchRpc(),
+        preference_store=PreferenceStore(tmp_path / "preference-fallback.db"),
+        resolver=service._resolver,
+    )
+    seed_service._preferences.record_liked_track(
+        track_id="catalog-track-favorite",
+        title="Liked Song",
+        artist_name="Favorite Artist",
+        item_kind="songs",
+        is_library=False,
+        session_request_text="play upbeat music",
+        session_search_query="missing cue",
+    )
+    seed_service._preferences.record_favored_artist(artist_name="Favorite Artist", session_search_query="missing cue")
+
+    result = seed_service.play_session("play some music")
+
+    assert result["result"]["tracks"][0]["title"] == "Liked Song"
+
+
+def test_global_rejects_are_excluded_from_new_session_caches(service) -> None:
+    service._preferences.record_global_rejected_track(
+        track_id="catalog-track-favorite",
+        title="Liked Song",
+        artist_name="Favorite Artist",
+    )
+
+    result = service.play_session("play upbeat music")
+
     assert result["result"]["tracks"][0]["title"] == "Another Song"
 
 

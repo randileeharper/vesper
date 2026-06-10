@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cider_agent import a2a
 
 
@@ -11,13 +13,13 @@ def test_execute_message_returns_completed_task(monkeypatch, service) -> None:
             "kind": "message",
             "messageId": "m-1",
             "role": "user",
-            "parts": [{"kind": "data", "data": {"action": "status", "parameters": {}}}],
+            "parts": [{"kind": "data", "data": {"action": "list_preferences", "parameters": {}}}],
         }
     )
 
     assert task["kind"] == "task"
     assert task["status"]["state"] == "completed"
-    assert task["metadata"]["action"] == "status"
+    assert task["metadata"]["action"] == "list_preferences"
     assert "summary" in task["metadata"]
 
 
@@ -88,6 +90,20 @@ def test_should_defer_message_for_mutating_structured_action() -> None:
     }
 
     assert a2a._should_defer_message(message) is True
+
+
+def test_execute_message_rejects_hidden_structured_action(monkeypatch, service) -> None:
+    monkeypatch.setattr(a2a, "get_service", lambda: service)
+
+    with pytest.raises(Exception, match="not publicly exposed"):
+        a2a._execute_message(
+            {
+                "kind": "message",
+                "messageId": "m-hidden",
+                "role": "user",
+                "parts": [{"kind": "data", "data": {"action": "status", "parameters": {}}}],
+            }
+        )
 
 
 def test_resolve_defer_mode_allows_explicit_override() -> None:

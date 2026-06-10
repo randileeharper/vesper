@@ -11,7 +11,7 @@ from .errors import PreferenceStoreError
 
 
 class PreferenceStore:
-    """Store explicit audio preferences in SQLite."""
+    """Store explicit music preferences and session state in SQLite."""
 
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
@@ -25,6 +25,7 @@ class PreferenceStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            # Legacy table retained for existing installs; new code does not write to it.
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS preferences (
@@ -43,6 +44,40 @@ class PreferenceStore:
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_preferences_unique
                 ON preferences(kind, COALESCE(category, ''), value)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS music_preferences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    preference_type TEXT NOT NULL,
+                    track_id TEXT,
+                    title TEXT,
+                    artist_id TEXT,
+                    artist_name TEXT,
+                    artist_key TEXT,
+                    album TEXT,
+                    item_kind TEXT,
+                    is_library INTEGER,
+                    session_request_text TEXT,
+                    session_search_query TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_music_preferences_track_unique
+                ON music_preferences(preference_type, track_id)
+                WHERE track_id IS NOT NULL AND track_id != ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_music_preferences_artist_unique
+                ON music_preferences(preference_type, artist_key)
+                WHERE artist_key IS NOT NULL AND artist_key != ''
                 """
             )
             connection.execute(
@@ -121,58 +156,183 @@ class PreferenceStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, kind, category, value, weight, note, created_at, updated_at
-                FROM preferences
-                ORDER BY kind ASC, category ASC, value ASC
+                SELECT
+                    id,
+                    preference_type,
+                    track_id,
+                    title,
+                    artist_id,
+                    artist_name,
+                    artist_key,
+                    album,
+                    item_kind,
+                    is_library,
+                    session_request_text,
+                    session_search_query,
+                    created_at,
+                    updated_at
+                FROM music_preferences
+                ORDER BY preference_type ASC, updated_at DESC, id DESC
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_music_preference_row(row) for row in rows]
 
-    def remember_preference(
+    def record_global_rejected_track(
         self,
         *,
-        kind: str,
-        value: str,
-        category: str | None = None,
-        weight: float = 1.0,
-        note: str | None = None,
+        track_id: str,
+        title: str | None = None,
+        artist_name: str | None = None,
+        album: str | None = None,
+        item_kind: str | None = None,
+        is_library: bool | None = None,
     ) -> dict[str, Any]:
+        return self._upsert_music_preference(
+            preference_type="globally_rejected_track",
+            match_field="track_id",
+            match_value=track_id,
+            payload={
+                "track_id": track_id,
+                "title": title,
+                "artist_name": artist_name,
+                "album": album,
+                "item_kind": item_kind,
+                "is_library": int(is_library) if is_library is not None else None,
+            },
+        )
+
+    def record_liked_track(
+        self,
+        *,
+        track_id: str,
+        title: str | None = None,
+        artist_id: str | None = None,
+        artist_name: str | None = None,
+        album: str | None = None,
+        item_kind: str | None = None,
+        is_library: bool | None = None,
+        session_request_text: str | None = None,
+        session_search_query: str | None = None,
+    ) -> dict[str, Any]:
+        return self._upsert_music_preference(
+            preference_type="liked_track",
+            match_field="track_id",
+            match_value=track_id,
+            payload={
+                "track_id": track_id,
+                "title": title,
+                "artist_id": artist_id,
+                "artist_name": artist_name,
+                "album": album,
+                "item_kind": item_kind,
+                "is_library": int(is_library) if is_library is not None else None,
+                "session_request_text": session_request_text,
+                "session_search_query": session_search_query,
+            },
+        )
+
+    def record_favored_artist(
+        self,
+        *,
+        artist_id: str | None = None,
+        artist_name: str | None = None,
+        session_request_text: str | None = None,
+        session_search_query: str | None = None,
+    ) -> dict[str, Any]:
+        artist_key = self._normalize_artist_key(artist_id=artist_id, artist_name=artist_name)
+        if artist_key is None:
+            raise PreferenceStoreError("Could not save favored artist without an artist id or name.")
+        return self._upsert_music_preference(
+            preference_type="favored_artist",
+            match_field="artist_key",
+            match_value=artist_key,
+            payload={
+                "artist_id": artist_id,
+                "artist_name": artist_name,
+                "artist_key": artist_key,
+                "session_request_text": session_request_text,
+                "session_search_query": session_search_query,
+            },
+        )
+
+    def liked_tracks(self) -> list[dict[str, Any]]:
+        return self._list_music_preferences_by_type("liked_track")
+
+    def favored_artists(self) -> list[dict[str, Any]]:
+        return self._list_music_preferences_by_type("favored_artist")
+
+    def globally_rejected_tracks(self) -> list[dict[str, Any]]:
+        return self._list_music_preferences_by_type("globally_rejected_track")
+
+    def globally_rejected_track_ids(self) -> set[str]:
+        return {
+            str(item["track_id"]).strip()
+            for item in self.globally_rejected_tracks()
+            if str(item.get("track_id", "")).strip()
+        }
+
+    def _upsert_music_preference(
+        self,
+        *,
+        preference_type: str,
+        match_field: str,
+        match_value: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not str(match_value).strip():
+            raise PreferenceStoreError(f"Could not save {preference_type}: missing match value.")
+        if match_field not in {"track_id", "artist_key"}:
+            raise PreferenceStoreError(f"Could not save {preference_type}: unsupported match field {match_field}.")
+        columns = (
+            "preference_type",
+            "track_id",
+            "title",
+            "artist_id",
+            "artist_name",
+            "artist_key",
+            "album",
+            "item_kind",
+            "is_library",
+            "session_request_text",
+            "session_search_query",
+        )
         try:
             with self._connect() as connection:
                 existing = connection.execute(
-                    """
-                    SELECT id FROM preferences
-                    WHERE kind = ? AND COALESCE(category, '') = COALESCE(?, '') AND value = ?
+                    f"""
+                    SELECT id FROM music_preferences
+                    WHERE preference_type = ? AND COALESCE({match_field}, '') = COALESCE(?, '')
                     """,
-                    (kind, category, value),
+                    (preference_type, match_value),
                 ).fetchone()
                 if existing is None:
                     cursor = connection.execute(
-                        """
-                        INSERT INTO preferences(kind, category, value, weight, note)
-                        VALUES (?, ?, ?, ?, ?)
+                        f"""
+                        INSERT INTO music_preferences({", ".join(columns)})
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (kind, category, value, weight, note),
+                        tuple(payload.get(column) if column != "preference_type" else preference_type for column in columns),
                     )
                     preference_id = int(cursor.lastrowid)
                 else:
                     preference_id = int(existing["id"])
+                    assignments = ", ".join(f"{column} = ?" for column in columns[1:])
                     connection.execute(
-                        """
-                        UPDATE preferences
-                        SET weight = ?, note = ?, updated_at = CURRENT_TIMESTAMP
+                        f"""
+                        UPDATE music_preferences
+                        SET {assignments}, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
                         """,
-                        (weight, note, preference_id),
+                        tuple(payload.get(column) for column in columns[1:]) + (preference_id,),
                     )
         except sqlite3.Error as exc:
-            raise PreferenceStoreError(f"Could not save preference: {exc}") from exc
+            raise PreferenceStoreError(f"Could not save {preference_type}: {exc}") from exc
         return self.get_preference(preference_id)
 
     def delete_preference(self, preference_id: int) -> bool:
         try:
             with self._connect() as connection:
-                cursor = connection.execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
+                cursor = connection.execute("DELETE FROM music_preferences WHERE id = ?", (preference_id,))
                 return cursor.rowcount > 0
         except sqlite3.Error as exc:
             raise PreferenceStoreError(f"Could not delete preference: {exc}") from exc
@@ -181,15 +341,82 @@ class PreferenceStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, kind, category, value, weight, note, created_at, updated_at
-                FROM preferences
+                SELECT
+                    id,
+                    preference_type,
+                    track_id,
+                    title,
+                    artist_id,
+                    artist_name,
+                    artist_key,
+                    album,
+                    item_kind,
+                    is_library,
+                    session_request_text,
+                    session_search_query,
+                    created_at,
+                    updated_at
+                FROM music_preferences
                 WHERE id = ?
                 """,
                 (preference_id,),
             ).fetchone()
         if row is None:
             raise PreferenceStoreError(f"Preference {preference_id} was not found.")
-        return dict(row)
+        return self._decode_music_preference_row(row)
+
+    def _list_music_preferences_by_type(self, preference_type: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    preference_type,
+                    track_id,
+                    title,
+                    artist_id,
+                    artist_name,
+                    artist_key,
+                    album,
+                    item_kind,
+                    is_library,
+                    session_request_text,
+                    session_search_query,
+                    created_at,
+                    updated_at
+                FROM music_preferences
+                WHERE preference_type = ?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (preference_type,),
+            ).fetchall()
+        return [self._decode_music_preference_row(row) for row in rows]
+
+    def _decode_music_preference_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "preference_type": row["preference_type"],
+            "track_id": row["track_id"],
+            "title": row["title"],
+            "artist_id": row["artist_id"],
+            "artist_name": row["artist_name"],
+            "artist_key": row["artist_key"],
+            "album": row["album"],
+            "item_kind": row["item_kind"],
+            "is_library": None if row["is_library"] is None else bool(row["is_library"]),
+            "session_request_text": row["session_request_text"],
+            "session_search_query": row["session_search_query"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _normalize_artist_key(self, *, artist_id: str | None, artist_name: str | None) -> str | None:
+        if artist_id is not None and str(artist_id).strip():
+            return f"id:{str(artist_id).strip()}"
+        if artist_name is not None and str(artist_name).strip():
+            normalized = " ".join(str(artist_name).strip().casefold().split())
+            return f"name:{normalized}"
+        return None
 
     def get_active_session(self) -> dict[str, Any] | None:
         with self._connect() as connection:

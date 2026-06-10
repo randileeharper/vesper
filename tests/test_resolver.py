@@ -117,6 +117,66 @@ def test_openai_compatible_resolver_sends_no_think_ollama_fields(settings: Setti
     assert body["reasoning"] == {"effort": "none"}
 
 
+def test_openai_compatible_resolver_uses_compact_allowed_action_list(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    captured: dict[str, object] = {}
+
+    class CapturePromptTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode("utf-8"))
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"action": "status", "parameters": {}}),
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=CapturePromptTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolver.resolve("what's in queue?", service)
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    messages = body["messages"]
+    assert isinstance(messages, list)
+    user_prompt = messages[1]["content"]
+    assert "allowed_actions" in user_prompt
+    assert "move_queue_item" not in user_prompt
+    assert "remove_queue_item" not in user_prompt
+    assert "clear_queue" not in user_prompt
+    assert "play_item(" not in user_prompt
+    assert "steer_session(request[, search_update])" in user_prompt
+    assert "like_current_track()" in user_prompt
+    assert "set_volume(volume)" in user_prompt
+    assert "list_library_playlists()" in user_prompt
+    assert "play_library_playlist(playlist_name)" in user_prompt
+    assert "recommend(" not in user_prompt
+
+
 def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
@@ -162,6 +222,100 @@ def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Setti
     resolved = resolver.resolve("play some pink", service)
 
     assert resolved.parameters["query"] == "Pink"
+
+
+def test_openai_compatible_resolver_normalizes_common_action_aliases(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class AliasTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "now_playing",
+                                    "parameters": {},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=AliasTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("what's playing?", service)
+
+    assert resolved.action == "get_now_playing"
+
+
+def test_openai_compatible_resolver_strips_function_style_action_suffix(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class FunctionStyleTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "next_track()",
+                                    "parameters": {},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=FunctionStyleTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("play the next track", service)
+
+    assert resolved.action == "next_track"
 
 
 def test_openai_compatible_resolver_normalizes_structured_session_search_update(settings: Settings, service) -> None:
@@ -352,6 +506,142 @@ def test_openai_compatible_resolver_can_reject_current_track(settings: Settings,
 
     assert resolved.action == "reject_current_track"
     assert resolved.parameters == {}
+
+
+def test_openai_compatible_resolver_can_like_current_track(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class LikeTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "like_current_track",
+                                    "parameters": {},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=LikeTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("i like this track", service)
+
+    assert resolved.action == "like_current_track"
+    assert resolved.parameters == {}
+
+
+def test_openai_compatible_resolver_can_list_playlists(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class PlaylistListTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"action": "list_library_playlists", "parameters": {}}),
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=PlaylistListTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("what playlists are available?", service)
+
+    assert resolved.action == "list_library_playlists"
+    assert resolved.parameters == {}
+
+
+def test_openai_compatible_resolver_can_play_playlist_by_name(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class PlaylistPlayTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"action": "play_library_playlist", "parameters": {"playlist": "Mix"}}
+                            ),
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=PlaylistPlayTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("play my playlist mix", service)
+
+    assert resolved.action == "play_library_playlist"
+    assert resolved.parameters == {"playlist_name": "Mix"}
 
 
 def test_openai_compatible_resolver_can_steer_session_without_interrupting(settings: Settings, service) -> None:

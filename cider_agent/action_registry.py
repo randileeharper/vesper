@@ -22,6 +22,7 @@ class ActionDefinition:
     required_fields: tuple[str, ...] = ()
     read_only: bool = False
     text_exposable: bool = True
+    public_exposed: bool = False
     session_aware: bool = False
     deferred_a2a_eligible: bool = True
     advanced_only: bool = False
@@ -41,6 +42,7 @@ def _definition(
     required_fields: tuple[str, ...] = (),
     read_only: bool = False,
     text_exposable: bool = True,
+    public_exposed: bool = False,
     session_aware: bool = False,
     deferred_a2a_eligible: bool | None = None,
     advanced_only: bool = False,
@@ -55,6 +57,7 @@ def _definition(
         required_fields=required_fields,
         read_only=read_only,
         text_exposable=text_exposable,
+        public_exposed=public_exposed,
         session_aware=session_aware,
         deferred_a2a_eligible=read_only if deferred_a2a_eligible is None else deferred_a2a_eligible,
         advanced_only=advanced_only,
@@ -81,21 +84,12 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     ),
     _definition("playback_snapshot", "Return a detailed playback snapshot.", "playback snapshot", lambda service, params: service.playback_snapshot(), read_only=True, advanced_only=True),
     _definition("is_playing", "Return whether playback is active.", "is playing", lambda service, params: service.is_playing(), read_only=True, advanced_only=True),
-    _definition("play", "Resume playback.", "play", lambda service, params: service.play(), text_patterns=(r"^\s*play\s*$", r"^\s*resume\s*$")),
-    _definition("pause", "Pause playback.", "pause", lambda service, params: service.pause(), text_patterns=(r"^\s*pause\s*$",)),
+    _definition("play", "Resume playback.", "play", lambda service, params: service.play(), public_exposed=True, text_patterns=(r"^\s*play\s*$", r"^\s*resume\s*$")),
+    _definition("pause", "Pause playback.", "pause", lambda service, params: service.pause(), public_exposed=True, text_patterns=(r"^\s*pause\s*$",)),
     _definition("playpause", "Toggle playback.", "playpause", lambda service, params: service.playpause(), advanced_only=True),
-    _definition("stop", "Stop playback and end any active session.", "stop", lambda service, params: service.stop()),
+    _definition("stop", "Stop playback and end any active session.", "stop", lambda service, params: service.stop(), public_exposed=True),
     _definition("next_track", "Skip to the next track or session-selected track.", "next track", lambda service, params: service.next_track()),
     _definition("previous_track", "Go to the previous track.", "previous track", lambda service, params: service.previous_track()),
-    _definition(
-        "seek",
-        "Seek to a playback position in seconds.",
-        "seek",
-        lambda service, params: service.seek(float(params["position_seconds"])),
-        parameter_schema={"position_seconds": {"type": "number"}},
-        required_fields=("position_seconds",),
-        advanced_only=True,
-    ),
     _definition("get_volume", "Get the current playback volume.", "volume", lambda service, params: service.get_volume(), read_only=True, advanced_only=True),
     _definition(
         "set_volume",
@@ -121,6 +115,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     _definition("play_item_href", "Play a specific item by href.", "play item href", lambda service, params: service.play_item_href(str(params["href"])), required_fields=("href",), advanced_only=True),
     _definition("play_session", "Start an adaptive session for a music request.", "play session", lambda service, params: service.play_session(str(params["request"])), required_fields=("request",), session_aware=True),
     _definition("steer_session", "Steer the active adaptive session.", "steer session", lambda service, params: service.steer_session(str(params["request"]), search_update=dict(params.get("search_update", {})) if isinstance(params.get("search_update"), dict) else None), required_fields=("request",), session_aware=True),
+    _definition("like_current_track", "Save the current track, artist, and session cue as a positive music preference.", "like current track", lambda service, params: service.like_current_track(), session_aware=True),
     _definition("reject_current_track", "Reject only the current session track.", "reject current track", lambda service, params: service.reject_current_track(), session_aware=True),
     _definition("session_status", "Show adaptive session status.", "session status", lambda service, params: service.session_status(), read_only=True, session_aware=True, text_patterns=(r"^\s*session\s+status\??\s*$",)),
     _definition("stop_session", "Stop the active adaptive session.", "stop session", lambda service, params: service.stop_session(), session_aware=True),
@@ -134,17 +129,40 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     _definition("search_library_playlists", "Search library playlists.", "search playlists", lambda service, params: service.search_library_playlists(str(params["query"]), limit=int(params.get("limit", 10))), required_fields=("query",), read_only=True),
     _definition("get_library_playlist", "Get a library playlist.", "get playlist", lambda service, params: service.get_library_playlist(str(params["playlist_id"])), required_fields=("playlist_id",), read_only=True),
     _definition("get_library_playlist_tracks", "Get library playlist tracks.", "playlist tracks", lambda service, params: service.get_library_playlist_tracks(str(params["playlist_id"]), limit=int(params.get("limit", 100)), offset=int(params.get("offset", 0))), required_fields=("playlist_id",), read_only=True),
+    _definition("play_library_playlist", "Play a library playlist by name.", "play playlist", lambda service, params: service.play_library_playlist(str(params["playlist_name"])), required_fields=("playlist_name",)),
     _definition("list_recently_played", "List recently played tracks.", "recently played", lambda service, params: service.list_recently_played(limit=int(params.get("limit", 25)), offset=int(params.get("offset", 0))), read_only=True),
     _definition("play_search_result", "Play a specific search result.", "play search result", lambda service, params: service.play_search_result(query=str(params["query"]), source=str(params.get("source", "default")), index=int(params.get("index", 0)), storefront=str(params.get("storefront", "us"))), required_fields=("query",)),
     _definition("play_candidate_match", "Resolve candidate tracks, artists, or queries into playback.", "play candidate match", lambda service, params: service.play_candidate_match(candidate_tracks=list(params.get("candidate_tracks", [])) or None, candidate_artists=list(params.get("candidate_artists", [])) or None, candidate_queries=list(params.get("candidate_queries", params.get("candidate_query", []))) or None, storefront=str(params.get("storefront", "us")))),
-    _definition("remember_preference", "Store an explicit music preference.", "remember preference", lambda service, params: service.remember_preference(kind=str(params["kind"]), value=str(params["value"]), category=str(params["category"]) if params.get("category") is not None else None, weight=float(params.get("weight", 1.0)), note=str(params["note"]) if params.get("note") is not None else None), required_fields=("kind", "value")),
-    _definition("list_preferences", "List explicit music preferences.", "list preferences", lambda service, params: service.list_preferences(), read_only=True),
-    _definition("forget_preference", "Delete a stored preference.", "forget preference", lambda service, params: service.forget_preference(int(params["preference_id"])), required_fields=("preference_id",)),
-    _definition("recommend", "Recommend music from explicit preferences.", "recommend", lambda service, params: service.recommend(query=str(params["query"]) if params.get("query") is not None else None, limit=int(params.get("limit", 5))), read_only=True),
-    _definition("play_recommendation", "Play one recommended track.", "play recommendation", lambda service, params: service.play_recommendation(query=str(params["query"]) if params.get("query") is not None else None)),
+    _definition("list_preferences", "List explicit music preferences.", "list preferences", lambda service, params: service.list_preferences(), read_only=True, public_exposed=True),
+    _definition("forget_preference", "Delete a stored preference.", "forget preference", lambda service, params: service.forget_preference(int(params["preference_id"])), required_fields=("preference_id",), public_exposed=True),
 )
 
 ACTION_REGISTRY: dict[str, ActionDefinition] = {definition.name: definition for definition in ACTION_DEFINITIONS}
+
+RESOLVER_ACTION_NAMES: tuple[str, ...] = (
+    "status",
+    "get_now_playing",
+    "get_queue",
+    "play",
+    "pause",
+    "stop",
+    "next_track",
+    "previous_track",
+    "set_volume",
+    "play_session",
+    "steer_session",
+    "like_current_track",
+    "reject_current_track",
+    "session_status",
+    "stop_session",
+    "search",
+    "list_library_playlists",
+    "play_library_playlist",
+    "play_search_result",
+    "play_candidate_match",
+    "list_preferences",
+    "forget_preference",
+)
 
 
 def get_action_definition(action: str) -> ActionDefinition | None:
@@ -163,6 +181,19 @@ def list_action_definitions(*, text_exposable_only: bool = False) -> list[Action
     if text_exposable_only:
         definitions = [definition for definition in definitions if definition.text_exposable and not definition.advanced_only]
     return definitions
+
+
+def list_public_action_definitions() -> list[ActionDefinition]:
+    return [definition for definition in ACTION_DEFINITIONS if definition.public_exposed]
+
+
+def is_public_action(action: str) -> bool:
+    definition = get_action_definition(action)
+    return bool(definition and definition.public_exposed)
+
+
+def list_resolver_action_definitions() -> list[ActionDefinition]:
+    return [ACTION_REGISTRY[name] for name in RESOLVER_ACTION_NAMES]
 
 
 def match_text_action_definition(text: str) -> ActionDefinition | None:

@@ -8,8 +8,7 @@ V1 includes:
 - queue inspection and mutation
 - Apple Music catalog and library search
 - library playlist browse
-- explicit preference memory in SQLite
-- deterministic preference-based recommendations with a pluggable recommender seam
+- music-specific preference memory in SQLite
 - optional OpenAI-compatible text resolver for natural-language requests
 
 ## Requirements
@@ -65,18 +64,16 @@ Environment variable overrides are available for every field:
 CLI:
 
 ```bash
-cider-agent status
-cider-agent now-playing
-cider-agent search default "k-pop"
-cider-agent search library "k-pop"
-cider-agent search catalog "k-pop"
+cider-agent play
+cider-agent pause
+cider-agent stop
+cider-agent preferences list
+cider-agent preferences forget 12
 cider-agent ask "play some kep1er"
 cider-agent ask "play something upbeat for the morning"
-cider-agent session status
-cider-agent session refill
+cider-agent ask "play some music"
 cider-agent ask "i don't like this"
-cider-agent preferences remember like "k-pop" --category genre
-cider-agent recommend --play
+cider-agent ask "i like this track"
 cider-agent serve
 ```
 
@@ -129,16 +126,20 @@ Recommended request shape:
 Typical text requests:
 
 - `play upbeat morning music`
+- `play some music`
+- `what playlists do I have?`
+- `play playlist Mix`
 - `add some KATSEYE`
 - `more pop`
 - `i don't like this`
+- `i like this track`
 - `what's playing?`
 
 Responses include a compact `summary` field for tool-friendly consumption, plus the structured execution payload.
 
-## Advanced structured actions
+## Structured actions
 
-Structured requests still exist for advanced integrations and testing, but they are not required for ordinary use.
+Structured requests still exist for integrations that want a tiny direct control surface, but they are not required for ordinary use. Everything outside the small exposed action set should go through plain-language text requests.
 
 Structured requests should send a `data` part:
 
@@ -156,10 +157,8 @@ Structured requests should send a `data` part:
         {
           "kind": "data",
           "data": {
-            "action": "play_session",
-            "parameters": {
-              "request": "play upbeat morning music"
-            }
+            "action": "play",
+            "parameters": {}
           }
         }
       ]
@@ -168,66 +167,20 @@ Structured requests should send a `data` part:
 }
 ```
 
-Common structured actions:
+Exposed structured actions:
 
-- `status`
-- `get_now_playing`
-- `play`, `pause`, `playpause`, `stop`, `next_track`, `previous_track`
-- `play_session`, `steer_session`, `reject_current_track`, `session_status`, `stop_session`, `refill_session`
-- `seek`, `set_volume`
-- `get_queue`, `move_queue_item`, `remove_queue_item`, `clear_queue`
-- `search`, `search_catalog`, `search_catalog_tracks`, `search_library`, `search_library_tracks`
-- `list_library_playlists`, `search_library_playlists`, `get_library_playlist`, `get_library_playlist_tracks`
-- `list_recently_played`
-- `remember_preference`, `list_preferences`, `forget_preference`
-- `recommend`, `play_recommendation`
+- `play`
+- `pause`
+- `stop`
+- `list_preferences`
+- `forget_preference`
 
-Implementation status:
+Hidden internal actions:
 
-| Action | Status | Notes |
-| --- | --- | --- |
-| `status` | implemented, tested | Service summary view with compact queue/session details. |
-| `get_now_playing` | implemented | Direct Cider RPC wrapper over `/now-playing`. |
-| `play` | implemented | Resumes native playback, or resumes an adaptive session if one is active. |
-| `pause` | implemented | Pauses playback and marks an active adaptive session as suspended. |
-| `playpause` | implemented | Thin RPC wrapper over `/playpause`. |
-| `stop` | implemented | Stops playback and clears any active adaptive session. |
-| `next_track` | implemented, tested | Skips natively when no session is active; otherwise advances the adaptive session immediately. |
-| `previous_track` | implemented | Thin RPC wrapper over `/previous`. |
-| `play_session` | implemented, tested | Starts an adaptive session and immediately resolves a playable track. |
-| `steer_session` | implemented, tested, deferred | Updates active session intent/query pools, but does not switch tracks immediately. The change takes effect on the next selection step. |
-| `reject_current_track` | implemented, tested | Rejects the current adaptive-session track and immediately advances without changing the overall vibe. |
-| `session_status` | implemented, tested | Reports active session state and recent session tracks. |
-| `stop_session` | implemented | Stops the active adaptive session without requiring a global playback stop. |
-| `refill_session` | implemented | Manually advances the active adaptive session. |
-| `seek` | implemented | Validated RPC wrapper over `/seek`. |
-| `set_volume` | implemented, tested | Normalizes user-friendly volume input to Cider’s `0.0-1.0` format. |
-| `get_queue` | implemented | Reads the current native queue and flattens track metadata. |
-| `move_queue_item` | implemented | Validated RPC wrapper over `/queue/move-to-position`. |
-| `remove_queue_item` | implemented | Validated RPC wrapper over `/queue/remove-by-index`. |
-| `clear_queue` | implemented | Thin RPC wrapper over `/queue/clear-queue`. |
-| `search` | implemented, tested | Dispatches to the configured default search source. |
-| `search_catalog` | implemented | Catalog search over Apple Music. |
-| `search_catalog_tracks` | implemented | Alias of `search_catalog`. |
-| `search_library` | implemented | Library search across songs, albums, artists, and playlists. |
-| `search_library_tracks` | implemented, tested | Library-song-only search. |
-| `list_library_playlists` | implemented | Read-only playlist listing through `run-v3`. |
-| `search_library_playlists` | implemented | Read-only playlist search through `run-v3`. |
-| `get_library_playlist` | implemented | Reads one library playlist by id. |
-| `get_library_playlist_tracks` | implemented | Reads tracks for one library playlist. |
-| `list_recently_played` | implemented | Read-only recently-played track listing. |
-| `remember_preference` | implemented, tested | Persists explicit likes/dislikes in local storage. |
-| `list_preferences` | implemented, tested | Lists stored preferences from local storage. |
-| `forget_preference` | implemented | Deletes one stored preference by id. |
-| `recommend` | implemented, tested | Generates recommendations from stored preferences. |
-| `play_recommendation` | implemented | Plays the top recommendation immediately. |
-
-Removed actions:
-
-| Action | Status | Notes |
-| --- | --- | --- |
-| `create_playlist` | removed | This was intentionally deleted instead of left as a failing stub because current Cider builds do not expose a reliable playlist mutation path. |
-| `add_playlist_tracks` | removed | Same reason as `create_playlist`; the mutation surface was dead and misleading. |
+- adaptive session, search, queue, resolver, and current-track feedback actions still exist internally
+- playlist listing and play-by-name are available through plain-language text requests
+- they are intentionally not part of the public structured contract
+- callers should use `cider-agent ask ...` or A2A text messages for those behaviors
 
 ## Architecture
 
@@ -244,6 +197,7 @@ Adaptive sessions are cache-driven:
 - the resolver only sees the next eligible window of 6 tracks at a time
 - cache entry state drives repeat avoidance and retry behavior
 - steering can preserve existing query pools, add new ones, or replace them entirely
+- extremely vague requests such as `play some music` can bootstrap from saved liked-track cues, favored artists, and directly liked tracks before normal adaptive selection takes over
 
 Track cache entries move through a small state machine:
 
@@ -259,6 +213,7 @@ This keeps most of the memory and repeat-avoidance work in the service instead o
 - Generic `search` uses `default_search_source` from config, which defaults to `catalog`.
 - Text requests go through the configured resolver backend. `fallback` only supports tiny direct commands like `play` and `pause`; `openai_compatible` sends chat-completions requests to a configurable OpenAI-style endpoint, including local endpoints such as Ollama when they expose the same API shape.
 - Generic or descriptive `play` requests usually start an adaptive session. Specific track requests still resolve to one-shot playback.
+- Playlist requests are text-first right now: asking to list playlists or play a playlist by name goes through the local resolver path rather than the tiny public structured API.
 - `response_detail` defaults to `compact`, which trims tool-facing execution results down to summaries instead of returning full raw Apple Music and Cider payloads.
 - The default request timeout is 60 seconds to accommodate slower local models and Cider RPC calls.
 
@@ -271,7 +226,8 @@ This keeps most of the memory and repeat-avoidance work in the service instead o
 - `preserve` keeps the current query pools and only changes future selection behavior.
 - `add` keeps the current pools and adds newly planned search pools alongside them.
 - `replace` discards the current pools and rebuilds from the replacement query set.
-- `reject_current_track` is the "skip this one, keep the vibe" action. It marks the current cached entry as rejected and immediately advances within the active session.
+- `like_current_track` is the lightweight "save this one" action. It stores the current track, its artist, and the active session cue/query context without changing playback.
+- `reject_current_track` is the "never this exact track again" action. It marks the current cached entry as rejected for the active session, persists a global hard reject, and immediately advances.
 - `resolver_include_reasoning` is a debug-only option. When enabled, `cider_agent` includes model-provided reasoning text if the resolver backend returns it.
 - `resolver_include_raw_output` is another debug-only option. When enabled, `cider_agent` includes the resolver's exact raw `message.content` as `resolver_raw_content`, plus the parsed JSON object as `resolver_raw_action`.
 - `resolver_debug_log_path` keeps a plain-text resolver trace file for the current resolver episode, wiping it each time a new episode starts and appending every resolver prompt/response involved in that episode.

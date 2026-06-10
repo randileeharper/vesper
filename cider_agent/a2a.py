@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .action_registry import get_action_definition, match_text_action_definition
+from .action_registry import get_action_definition, is_public_action, match_text_action_definition
 from .app import get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
 from .renderers import render_action_result_for_a2a, render_text_result_for_a2a
@@ -98,16 +98,16 @@ def build_agent_card() -> dict[str, Any]:
                 "name": "Natural-Language Music Control",
                 "description": "Send plain-language music requests like 'play upbeat morning music', 'more pop', or 'what's playing?'.",
                 "tags": ["audio", "playback", "music"],
-                "examples": ["Play upbeat morning music", "I don't like this", "Add some KATSEYE"],
+                "examples": ["Play upbeat morning music", "I don't like this", "Play some music"],
                 "inputModes": ["text/plain"],
                 "outputModes": ["application/json", "text/plain"],
             },
             {
                 "id": "advanced-structured-actions",
                 "name": "Advanced Structured Actions",
-                "description": "Structured action payloads are supported for advanced integrations, but most callers should use natural-language text requests instead.",
+                "description": "Structured action payloads are intentionally limited to the small public playback and preference surface; use natural-language text requests for everything else.",
                 "tags": ["advanced", "structured", "integration"],
-                "examples": ["Status", "Search my library for k-pop", "Set volume to 35"],
+                "examples": ["Play", "Pause", "Stop", "List preferences"],
                 "inputModes": ["application/json", "text/plain"],
                 "outputModes": ["application/json"],
             },
@@ -171,6 +171,10 @@ def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[st
             action = str(payload.get("action", "")).strip()
             if not action:
                 raise CiderValidationError("Data part must include a non-empty action.")
+            if not is_public_action(action):
+                raise CiderValidationError(
+                    f"Structured action '{action}' is not publicly exposed. Use a plain-language text request instead."
+                )
             parameters = payload.get("parameters", {})
             if parameters is None:
                 parameters = {}

@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from .action_registry import list_action_definitions
+from .action_registry import list_resolver_action_definitions
 from .config import Settings
 from .errors import ResolverError
 
@@ -125,6 +125,40 @@ class OpenAICompatibleResolver:
 
     MAX_SESSION_SEARCH_QUERIES = 1
     MAX_SESSION_SELECTION_CANDIDATES = 6
+    ACTION_ALIASES = {
+        "now_playing": "get_now_playing",
+        "current_track": "get_now_playing",
+        "what_is_playing": "get_now_playing",
+        "nowplaying": "get_now_playing",
+        "queue_status": "get_queue",
+        "show_queue": "get_queue",
+        "next": "next_track",
+        "skip": "next_track",
+        "previous": "previous_track",
+        "prev": "previous_track",
+        "back": "previous_track",
+        "resume": "play",
+        "resume_playback": "play",
+        "volume": "set_volume",
+        "play_search": "play_search_result",
+        "play_result": "play_search_result",
+        "play_candidate": "play_candidate_match",
+        "candidate_match": "play_candidate_match",
+        "show_preferences": "list_preferences",
+        "get_preferences": "list_preferences",
+        "list_playlists": "list_library_playlists",
+        "show_playlists": "list_library_playlists",
+        "play_playlist": "play_library_playlist",
+        "delete_preference": "forget_preference",
+        "remove_preference": "forget_preference",
+        "like_track": "like_current_track",
+        "like_current_song": "like_current_track",
+        "skip_current_track": "reject_current_track",
+        "reject_track": "reject_current_track",
+        "update_session": "steer_session",
+        "adjust_session": "steer_session",
+        "start_session": "play_session",
+    }
 
     def __init__(self, settings: Settings, session: httpx.Client | None = None) -> None:
         self._settings = settings
@@ -154,7 +188,7 @@ class OpenAICompatibleResolver:
         if callable(logger):
             logger(stage="resolve_text_request", messages=messages, response_body=body, response_content=content)
         parsed = self._parse_json_object(content)
-        action = str(parsed.get("action", "")).strip()
+        action = self._normalize_action_name(parsed.get("action"))
         parameters = parsed.get("parameters", {})
         if not action:
             raise ResolverError("Resolver output did not include an action.")
@@ -241,52 +275,26 @@ class OpenAICompatibleResolver:
             },
             "active_session": active_session,
             "preferences": service.list_preferences()["preferences"][:5],
-            "supported_actions": [
-                {
-                    "name": definition.name,
-                    "description": definition.description,
-                    "required_fields": list(definition.required_fields),
-                    "read_only": definition.read_only,
-                    "session_aware": definition.session_aware,
-                }
-                for definition in list_action_definitions(text_exposable_only=True)
-            ],
-            "notes": [
-                "Return JSON only with keys action and parameters.",
-                "Use source='default' when selecting search results unless the request explicitly mentions library or catalog.",
-                "Playlist creation and add-track mutation are unsupported and must not be selected.",
-                "If the user names a specific song and artist, you may use play_search_result or play_candidate_match.",
-                "If the user asks for a vibe, era, popularity, activity, time-of-day, or descriptive request, prefer play_session.",
-                "If the user asks for something by an artist without naming a specific track, prefer play_session.",
-                "If there is an active session and the user asks for a change like 'more pop' or 'more of this artist', prefer steer_session.",
-                "If there is an active session and the new request implies a major change of activity, mood, or context, starting a new play_session is acceptable.",
-                "If there is an active session and the user says things like 'I don't like this', 'skip this', 'not this one', or otherwise rejects only the current track, prefer reject_current_track instead of changing the whole session vibe.",
-                "Positive steering like 'i like this artist', 'more like this', 'more pop', or 'more of this artist' should usually use steer_session and affect future picks rather than interrupting the current song.",
-                "Negative feedback about the current song should usually use reject_current_track and change the song now.",
-                "For play_session and steer_session, return a request string that can be persisted as session steering state.",
-                "For steer_session, you may also return search_update with shape {\"mode\": \"preserve\"|\"add\"|\"replace\", \"queries\": [string, ...]}.",
-                "Use search_update.mode='preserve' when steering should only affect post-search selection and should not change the session search query.",
-                "Use search_update.mode='add' only for additive or expansive steering that should broaden the search space, such as mixing in a new artist or genre.",
-                "Use search_update.mode='replace' only when the user is clearly changing the session direction enough that the old search query should be replaced.",
-                "If the user says something like 'more like this', 'more of this artist', or similar session steering, rewrite it into a concrete request using the current track and artist when possible.",
-                "Do not invent fake artists or track titles.",
-                "For play_session and steer_session, use the parameter name 'request'. Do not use 'request_text' or any alternate field names.",
-                "For session-style playback, the session will later search the catalog and choose from real results, so focus on producing a good search/steering request.",
-                "If the user asks what is playing, use get_now_playing.",
-                "If the user asks to resume, use play. If the user asks to pause, use pause.",
-            ],
+            "allowed_actions": self._resolver_action_specs(),
         }
         system = (
-            "You are a music control resolver for cider_agent. "
-            "Convert a user request into one structured action for the supported action set. "
-            "Return only JSON with shape {\"action\": string, \"parameters\": object}. "
-            "Do not explain your reasoning. "
-            "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something. "
-            "Treat generic or descriptive play requests as adaptive long-form listening sessions. "
-            "When a user gives negative feedback about only the currently playing song, reject just that track rather than changing the whole session. "
-            "When a user gives positive steering about the current session, preserve that as future session direction rather than interrupting the current song. "
-            "You may infer a helpful music request from surrounding life context when the user is clearly asking for music help, such as cleaning, studying, waking up, or winding down. "
-            "For descriptive playback requests, produce a good search or steering request rather than guessing final tracks from memory."
+            "You are the cider_agent request resolver. "
+            "Return exactly one JSON object with keys action and parameters. "
+            "Use only an action from allowed_actions. "
+            "Do not explain anything. "
+            "Use the bare action name only, for example next_track not next_track(). "
+            "Do not use markdown, code fences, comments, or prose. "
+            "Use play_session for descriptive music requests, vibe requests, activity requests, or artist-only requests. "
+            "Use list_library_playlists when the user asks what playlists are available or to list playlists. "
+            "Use play_library_playlist when the user asks to play a specific playlist by name. "
+            "Use like_current_track when the user says they like the current song or track. "
+            "Use steer_session only when there is already an active session and the user wants to shape future picks. "
+            "Use reject_current_track when the user dislikes only the current song and wants a new one now. "
+            "When the user asks for vague playback like 'play some music', still use play_session. "
+            "Use play_search_result or play_candidate_match only for specific song requests. "
+            "For play_session and steer_session, always use parameters.request. "
+            "Keep request text short and concrete. "
+            "Do not invent songs, artists, or albums."
         )
         return [
             {"role": "system", "content": system},
@@ -310,6 +318,7 @@ class OpenAICompatibleResolver:
             "Treat session_steering as persistent cumulative session state, not a one-turn hint. "
             "Negative steering must continue to apply to future selections until explicitly overridden. "
             "Positive steering must continue to shape future selections until explicitly overridden. "
+            "If the session request is extremely vague, the service may already seed playback from saved preferences; do not force a made-up micro-vibe in that case. "
             "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
             "If the user already asked for a specific genre, artist, era, or other concrete music descriptor, preserve that request broadly instead of narrowing it to a more specific sub-vibe, mood, or subset unless the user explicitly asked for that narrowing. "
             "For example, a request like 'play trip-hop' should stay broad and should not be rewritten into a narrower variant like 'atmospheric trip hop' unless the user asked for atmospheric music. "
@@ -482,8 +491,34 @@ class OpenAICompatibleResolver:
 
     def _normalize_parameters(self, action: str, parameters: dict[str, Any], *, original_text: str) -> dict[str, Any]:
         normalized = dict(parameters)
+        if action == "forget_preference":
+            if "preference_id" not in normalized:
+                for alias in ("id", "preference", "preferenceId"):
+                    if alias in normalized:
+                        normalized["preference_id"] = normalized[alias]
+                        break
+        if action == "play_library_playlist":
+            playlist_name = normalized.get("playlist_name")
+            if not isinstance(playlist_name, str):
+                for alias in ("name", "playlist", "query", "request"):
+                    candidate = normalized.get(alias)
+                    if isinstance(candidate, str):
+                        playlist_name = candidate
+                        normalized["playlist_name"] = candidate.strip()
+                        break
+            elif playlist_name.strip():
+                normalized["playlist_name"] = playlist_name.strip()
+            for alias in ("name", "playlist", "query"):
+                normalized.pop(alias, None)
         if action in {"search", "search_catalog", "search_library", "search_catalog_tracks", "search_library_tracks", "play_search_result"}:
             query = normalized.get("query")
+            if not isinstance(query, str):
+                for alias in ("request", "text", "term", "search"):
+                    candidate = normalized.get(alias)
+                    if isinstance(candidate, str):
+                        query = candidate
+                        normalized["query"] = candidate
+                        break
             if isinstance(query, str):
                 normalized_query = self._normalize_query_text(query)
                 if normalized_query:
@@ -512,6 +547,41 @@ class OpenAICompatibleResolver:
                 normalized["search_update"] = self._normalize_search_update(normalized.get("search_update"))
             normalized.pop("request_text", None)
         return normalized
+
+    def _normalize_action_name(self, value: Any) -> str:
+        action = str(value or "").strip()
+        if not action:
+            return ""
+        action = re.sub(r"\s*\([^)]*\)\s*$", "", action).strip()
+        normalized_key = action.casefold().replace("-", "_").replace(" ", "_")
+        return self.ACTION_ALIASES.get(normalized_key, normalized_key)
+
+    def _resolver_action_specs(self) -> list[str]:
+        specs: list[str] = []
+        for definition in list_resolver_action_definitions():
+            if definition.name == "play_search_result":
+                specs.append("play_search_result(query[, source, index])")
+                continue
+            if definition.name == "play_candidate_match":
+                specs.append("play_candidate_match(candidate_tracks|candidate_artists|candidate_queries)")
+                continue
+            if definition.name == "set_volume":
+                specs.append("set_volume(volume)")
+                continue
+            if definition.name == "forget_preference":
+                specs.append("forget_preference(preference_id)")
+                continue
+            if definition.name == "play_library_playlist":
+                specs.append("play_library_playlist(playlist_name)")
+                continue
+            if definition.name == "steer_session":
+                specs.append("steer_session(request[, search_update])")
+                continue
+            if definition.required_fields:
+                specs.append(f"{definition.name}({', '.join(definition.required_fields)})")
+                continue
+            specs.append(f"{definition.name}()")
+        return specs
 
     def _normalize_query_text(self, query: str) -> str:
         cleaned = query.strip()
