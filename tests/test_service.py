@@ -4,25 +4,10 @@ import pytest
 
 from cider_agent.action_registry import get_action_definition
 from cider_agent.config import Settings
-from cider_agent.errors import CiderRpcError, CiderValidationError, TextRequestExecutionError
+from cider_agent.errors import CiderValidationError, TextRequestExecutionError
 from cider_agent.resolver import ResolvedAction
 from cider_agent.service import CiderAgentService
 from cider_agent.storage import PreferenceStore
-
-
-def test_create_playlist_is_explicitly_unsupported(service) -> None:
-    with pytest.raises(CiderRpcError):
-        service.create_playlist(name="Late Night Mix")
-
-
-def test_add_playlist_tracks_requires_refs(service) -> None:
-    with pytest.raises(CiderValidationError):
-        service.add_playlist_tracks("playlist-1", track_refs=[])
-
-
-def test_add_playlist_tracks_is_explicitly_unsupported(service) -> None:
-    with pytest.raises(CiderRpcError):
-        service.add_playlist_tracks("playlist-1", track_refs=[{"id": "track-1", "type": "songs"}])
 
 
 def test_preferences_round_trip(service) -> None:

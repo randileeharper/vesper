@@ -671,29 +671,6 @@ class CiderAgentService:
             "raw": payload,
         }
 
-    def create_playlist(
-        self,
-        *,
-        name: str,
-        description: str | None = None,
-        track_refs: list[dict[str, str]] | None = None,
-    ) -> dict[str, Any]:
-        if not name.strip():
-            raise CiderValidationError("name cannot be empty.")
-        raise CiderRpcError(
-            "Current Cider RPC builds do not expose a working playlist creation endpoint through /api/v1/amapi/run-v3.",
-            detail="Live probing showed run-v3 accepts path-only read requests and ignores mutation payloads.",
-        )
-
-    def add_playlist_tracks(self, playlist_id: str, *, track_refs: list[dict[str, str]]) -> dict[str, Any]:
-        self._validate_playlist_id(playlist_id)
-        if not track_refs:
-            raise CiderValidationError("track_refs cannot be empty.")
-        raise CiderRpcError(
-            "Current Cider RPC builds do not expose a working playlist track mutation endpoint through /api/v1/amapi/run-v3.",
-            detail="Live probing showed run-v3 accepts path-only read requests and ignores mutation payloads.",
-        )
-
     def list_recently_played(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
         self._validate_limit_offset(limit, offset)
         path = f"/v1/me/recent/played/tracks?limit={limit}"

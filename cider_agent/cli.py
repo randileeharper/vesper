@@ -144,16 +144,7 @@ def _build_action_request(args: argparse.Namespace) -> tuple[str, dict[str, Any]
             return "list_library_playlists", {}
         if args.playlist_command == "tracks":
             return "get_library_playlist_tracks", {"playlist_id": args.playlist_id}
-        if args.playlist_command == "create":
-            return "create_playlist", {
-                "name": args.name,
-                "description": args.description,
-                "track_refs": _parse_track_refs(args.track_ref) if args.track_ref else None,
-            }
-        return "add_playlist_tracks", {
-            "playlist_id": args.playlist_id,
-            "track_refs": _parse_track_refs(args.track_ref),
-        }
+        return None
     if args.command == "preferences":
         if args.preferences_command == "list":
             return "list_preferences", {}
@@ -257,18 +248,6 @@ def _build_parser() -> argparse.ArgumentParser:
     playlist_subparsers.add_parser("list")
     playlist_show = playlist_subparsers.add_parser("tracks")
     playlist_show.add_argument("playlist_id")
-    playlist_create = playlist_subparsers.add_parser("create")
-    playlist_create.add_argument("name")
-    playlist_create.add_argument("--description")
-    playlist_create.add_argument(
-        "--track-ref",
-        action="append",
-        default=[],
-        help="Track ref in id:type form. Repeatable.",
-    )
-    playlist_add = playlist_subparsers.add_parser("add-tracks")
-    playlist_add.add_argument("playlist_id")
-    playlist_add.add_argument("--track-ref", action="append", required=True, help="Track ref in id:type form.")
 
     preferences = subparsers.add_parser("preferences")
     preferences_subparsers = preferences.add_subparsers(dest="preferences_command", required=True)
@@ -292,16 +271,6 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int)
 
     return parser
-
-
-def _parse_track_refs(values: list[str]) -> list[dict[str, str]]:
-    refs: list[dict[str, str]] = []
-    for value in values:
-        track_id, _, track_type = value.partition(":")
-        refs.append({"id": track_id, "type": track_type or "songs"})
-    return refs
-
-
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -375,19 +344,8 @@ def main() -> None:
             elif args.command == "playlist":
                 if args.playlist_command == "list":
                     payload = service.list_library_playlists()
-                elif args.playlist_command == "tracks":
-                    payload = service.get_library_playlist_tracks(args.playlist_id)
-                elif args.playlist_command == "create":
-                    payload = service.create_playlist(
-                        name=args.name,
-                        description=args.description,
-                        track_refs=_parse_track_refs(args.track_ref) if args.track_ref else None,
-                    )
                 else:
-                    payload = service.add_playlist_tracks(
-                        args.playlist_id,
-                        track_refs=_parse_track_refs(args.track_ref),
-                    )
+                    payload = service.get_library_playlist_tracks(args.playlist_id)
             elif args.command == "preferences":
                 if args.preferences_command == "list":
                     payload = service.list_preferences()

@@ -179,11 +179,8 @@ Common structured actions:
 - `search`, `search_catalog`, `search_catalog_tracks`, `search_library`, `search_library_tracks`
 - `list_library_playlists`, `search_library_playlists`, `get_library_playlist`, `get_library_playlist_tracks`
 - `list_recently_played`
-- `create_playlist`, `add_playlist_tracks`
 - `remember_preference`, `list_preferences`, `forget_preference`
 - `recommend`, `play_recommendation`
-
-Playlist mutation actions are part of the structured surface, but current Cider RPC builds do not expose working mutation endpoints through `/api/v1/amapi/run-v3`, so `create_playlist` and `add_playlist_tracks` currently fail with a clear RPC error instead of mutating anything.
 
 ## Architecture
 
@@ -217,7 +214,6 @@ This keeps most of the memory and repeat-avoidance work in the service instead o
 - Generic or descriptive `play` requests usually start an adaptive session. Specific track requests still resolve to one-shot playback.
 - `response_detail` defaults to `compact`, which trims tool-facing execution results down to summaries instead of returning full raw Apple Music and Cider payloads.
 - The default request timeout is 60 seconds to accommodate slower local models and Cider RPC calls.
-- Playlist mutation actions are exposed in the structured API, but current Cider RPC builds do not provide working mutation endpoints through `/api/v1/amapi/run-v3`, so `create_playlist` and `add_playlist_tracks` currently fail with a clear RPC error.
 
 ## Development notes
 
