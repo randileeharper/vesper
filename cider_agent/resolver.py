@@ -123,6 +123,7 @@ class FallbackResolver:
 class OpenAICompatibleResolver:
     """Resolve text requests using an OpenAI-compatible chat completions endpoint."""
 
+    MAX_COMPLETION_ATTEMPTS = 5
     MAX_SESSION_SEARCH_QUERIES = 1
     MAX_SESSION_SELECTION_CANDIDATES = 6
     ACTION_ALIASES = {
@@ -183,11 +184,10 @@ class OpenAICompatibleResolver:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
 
         messages = self._build_messages(text, service)
-        body, content = self._complete_json(messages, headers)
+        body, content, parsed = self._complete_parsed_json(messages, headers)
         logger = getattr(service, "append_resolver_debug_log", None)
         if callable(logger):
             logger(stage="resolve_text_request", messages=messages, response_body=body, response_content=content)
-        parsed = self._parse_json_object(content)
         action = self._normalize_action_name(parsed.get("action"))
         parameters = parsed.get("parameters", {})
         if not action:
@@ -209,11 +209,10 @@ class OpenAICompatibleResolver:
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
         messages = self._build_session_messages(request, service, session, count)
-        body, content = self._complete_json(messages, headers)
+        body, content, parsed = self._complete_parsed_json(messages, headers)
         logger = getattr(service, "append_resolver_debug_log", None)
         if callable(logger):
             logger(stage="plan_session_query", messages=messages, response_body=body, response_content=content)
-        parsed = self._parse_json_object(content)
         search_queries = self._normalize_candidate_queries(parsed.get("search_queries"))
         if not search_queries:
             search_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))
@@ -242,11 +241,10 @@ class OpenAICompatibleResolver:
         if self._settings.resolver_api_key:
             headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
         messages = self._build_session_selection_messages(request, service, session, search_query, candidates)
-        body, content = self._complete_json(messages, headers)
+        body, content, parsed = self._complete_parsed_json(messages, headers)
         logger = getattr(service, "append_resolver_debug_log", None)
         if callable(logger):
             logger(stage="select_session_track", messages=messages, response_body=body, response_content=content)
-        parsed = self._parse_json_object(content)
         selected_index = parsed.get("selected_index")
         if not isinstance(selected_index, int):
             selected_index = 0
@@ -411,6 +409,24 @@ class OpenAICompatibleResolver:
         except ValueError as exc:
             raise ResolverError("Resolver endpoint returned non-JSON output.") from exc
         return body, self._extract_content(body)
+
+    def _complete_parsed_json(
+        self, messages: list[dict[str, str]], headers: dict[str, str]
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        last_error: ResolverError | None = None
+        for attempt in range(1, self.MAX_COMPLETION_ATTEMPTS + 1):
+            try:
+                body, content = self._complete_json(messages, headers)
+                return body, content, self._parse_json_object(content)
+            except ResolverError as exc:
+                last_error = exc
+                if attempt == self.MAX_COMPLETION_ATTEMPTS:
+                    break
+        if last_error is None:
+            raise ResolverError("Resolver request failed without producing a completion result.")
+        raise ResolverError(
+            f"Resolver failed after {self.MAX_COMPLETION_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     def _extract_content(self, body: dict[str, Any]) -> str:
         choices = body.get("choices")
