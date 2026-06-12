@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import uuid
@@ -10,10 +11,33 @@ from typing import Any
 
 import httpx
 
-from .a2a import _message
 from .app import get_service, get_settings
 from .errors import CiderAgentError, TextRequestExecutionError
 from .renderers import render_task_payload_for_cli
+
+
+def _load_a2a_sdk():
+    try:
+        from a2a.client import ClientConfig
+        from a2a.client.client_factory import ClientFactory
+        from a2a.client.errors import AgentCardResolutionError
+        from a2a.helpers import new_data_part, new_text_part
+        from a2a.types import Message, Role, SendMessageRequest, Task, TaskState
+    except ModuleNotFoundError as exc:
+        raise ConnectionError("A2A SDK is not installed in this interpreter.") from exc
+
+    return {
+        "AgentCardResolutionError": AgentCardResolutionError,
+        "ClientConfig": ClientConfig,
+        "ClientFactory": ClientFactory,
+        "Message": Message,
+        "Role": Role,
+        "SendMessageRequest": SendMessageRequest,
+        "Task": Task,
+        "TaskState": TaskState,
+        "new_data_part": new_data_part,
+        "new_text_part": new_text_part,
+    }
 
 
 def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
@@ -24,76 +48,104 @@ def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
-def _post_local_a2a(*, method: str, params: dict[str, Any]) -> dict[str, Any]:
+def _build_user_message(*, text: str | None = None, action: str | None = None, parameters: dict[str, Any] | None = None) -> Any:
+    sdk = _load_a2a_sdk()
+    parts = []
+    if text is not None:
+        parts.append(sdk["new_text_part"](text, media_type="text/plain"))
+    if action is not None:
+        parts.append(
+            sdk["new_data_part"](
+                {"action": action, "parameters": parameters or {}},
+                media_type="application/json",
+            )
+        )
+    return sdk["Message"](
+        role=sdk["Role"].ROLE_USER,
+        message_id=str(uuid.uuid4()),
+        parts=parts,
+    )
+
+
+async def _send_local_a2a_request(message: Any) -> Any:
+    sdk = _load_a2a_sdk()
     settings = get_settings()
-    endpoint = f"{settings.public_base_url}/a2a"
-    request_id = str(uuid.uuid4())
-    payload = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": method,
-        "params": params,
-    }
+    httpx_client = httpx.AsyncClient(
+        timeout=settings.request_timeout_seconds,
+        verify=settings.verify_tls,
+    )
+    client = None
     try:
-        with httpx.Client(timeout=settings.request_timeout_seconds, verify=settings.verify_tls) as client:
-            response = client.post(endpoint, json=payload)
+        client = await sdk["ClientFactory"](
+            sdk["ClientConfig"](streaming=False, polling=False, httpx_client=httpx_client)
+        ).create_from_url(settings.public_base_url)
+    except (httpx.HTTPError, sdk["AgentCardResolutionError"], ConnectionError) as exc:
+        await httpx_client.aclose()
+        raise ConnectionError(str(exc)) from exc
+    try:
+        async for response in client.send_message(sdk["SendMessageRequest"](message=message)):
+            if response.HasField("task"):
+                return response.task
+            if response.HasField("message"):
+                return response.message
+        raise CiderAgentError("Local A2A server returned an empty response.")
     except httpx.HTTPError as exc:
         raise ConnectionError(str(exc)) from exc
-    response.raise_for_status()
-    body = response.json()
-    if "error" in body:
-        error = body["error"]
-        message_text = str(error.get("message", "Unknown server error."))
-        data = error.get("data")
-        if isinstance(data, dict):
-            raise TextRequestExecutionError(message_text, data)
-        raise CiderAgentError(message_text)
-    result = body.get("result")
-    if not isinstance(result, dict):
-        raise CiderAgentError("Local A2A server returned an invalid task payload.")
-    return result
+    finally:
+        if client is not None:
+            await client.close()
+        else:
+            await httpx_client.aclose()
 
 
-def _raise_for_failed_task(task: dict[str, Any]) -> None:
-    status = task.get("status", {})
+def _raise_for_failed_task(task: Any) -> None:
+    sdk = _load_a2a_sdk()
+    state = task.status.state
+    status_message = task.status.message if task.status.HasField("message") else None
     message = "Local A2A server task failed."
-    payload: dict[str, Any] | None = None
-    if isinstance(status, dict):
-        status_message = status.get("message")
-        if isinstance(status_message, dict):
-            payload = None
-            parts = status_message.get("parts", [])
-            if isinstance(parts, list):
-                for part in parts:
-                    if isinstance(part, dict) and part.get("kind") == "data" and isinstance(part.get("data"), dict):
-                        payload = dict(part["data"])
-                        break
-            parts = status_message.get("parts", [])
-            if isinstance(parts, list):
-                for part in parts:
-                    if isinstance(part, dict) and part.get("kind") == "text" and isinstance(part.get("text"), str):
-                        text = part["text"].strip()
-                        if text:
-                            message = text
-                            break
-    if isinstance(payload, dict):
+    payload = {"status": "error", "message": message}
+    if status_message is not None:
+        try:
+            rendered = render_task_payload_for_cli(status_message)
+            if isinstance(rendered, dict):
+                payload = rendered
+        except ValueError:
+            payload = {"status": "error", "message": message}
+        for part in status_message.parts:
+            if part.HasField("text") and part.text.strip():
+                message = part.text.strip()
+                break
+    if state in {
+        sdk["TaskState"].TASK_STATE_FAILED,
+        sdk["TaskState"].TASK_STATE_REJECTED,
+        sdk["TaskState"].TASK_STATE_CANCELED,
+    }:
         raise TextRequestExecutionError(message, payload)
     raise CiderAgentError(message)
 
 
-def _call_local_a2a(message: dict[str, Any]) -> dict[str, Any]:
-    task = _post_local_a2a(method="message/send", params={"message": message, "defer": False})
-    state = str(task.get("status", {}).get("state", "")).strip().lower()
-    if state != "completed":
-        _raise_for_failed_task(task)
-    return task
+def _call_local_a2a(message: Any) -> Any:
+    sdk = _load_a2a_sdk()
+    result = asyncio.run(_send_local_a2a_request(message))
+    if isinstance(result, sdk["Task"]):
+        terminal = {
+            sdk["TaskState"].TASK_STATE_COMPLETED,
+            sdk["TaskState"].TASK_STATE_FAILED,
+            sdk["TaskState"].TASK_STATE_REJECTED,
+            sdk["TaskState"].TASK_STATE_CANCELED,
+        }
+        if result.status.state not in terminal:
+            raise CiderAgentError("Local A2A server returned a non-terminal task.")
+        if result.status.state != sdk["TaskState"].TASK_STATE_COMPLETED:
+            _raise_for_failed_task(result)
+    return result
 
 
-def _task_to_cli_payload(task: dict[str, Any], *, original_text: str | None = None) -> dict[str, Any]:
+def _task_to_cli_payload(task: Any, *, original_text: str | None = None) -> dict[str, Any]:
     try:
         return render_task_payload_for_cli(task, original_text=original_text)
     except ValueError as exc:
-        raise CiderAgentError("Local A2A server task did not include a data artifact.") from exc
+        raise CiderAgentError("Local A2A server response did not include a data payload.") from exc
 
 
 def _build_action_request(args: argparse.Namespace) -> tuple[str, dict[str, Any]] | None:
@@ -112,24 +164,14 @@ def _build_action_request(args: argparse.Namespace) -> tuple[str, dict[str, Any]
 
 def _run_via_local_server(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "ask":
-        task = _call_local_a2a(
-            _message(
-                "user",
-                [{"kind": "text", "text": args.text}],
-            )
-        )
+        task = _call_local_a2a(_build_user_message(text=args.text))
         return _task_to_cli_payload(task, original_text=args.text)
 
     action_request = _build_action_request(args)
     if action_request is None:
         raise CiderAgentError(f"Unsupported CLI command for local server mode: {args.command}")
     action, parameters = action_request
-    task = _call_local_a2a(
-        _message(
-            "user",
-            [{"kind": "data", "data": {"action": action, "parameters": parameters}}],
-        )
-    )
+    task = _call_local_a2a(_build_user_message(action=action, parameters=parameters))
     return _task_to_cli_payload(task)
 
 

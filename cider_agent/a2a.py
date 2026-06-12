@@ -1,20 +1,41 @@
-"""Minimal A2A-compatible HTTP server for cider_agent."""
+"""A2A transport built on top of ``a2a-sdk``."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 import uvicorn
-from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from google.protobuf.json_format import MessageToDict, ParseDict
+from google.protobuf.struct_pb2 import Struct
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from a2a.helpers import new_data_part, new_task, new_text_part
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandlerV2
+from a2a.server.routes import (
+    add_a2a_routes_to_fastapi,
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+    Message,
+    Role,
+    TaskState,
+)
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, PROTOCOL_VERSION_1_0, TransportProtocol
+from a2a.utils.errors import InternalError, InvalidParamsError
 
 from .action_registry import get_action_definition, is_public_action, match_text_action_definition
 from .app import get_service, get_settings
@@ -22,307 +43,345 @@ from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionE
 from .renderers import render_action_result_for_a2a, render_text_result_for_a2a
 
 
-def _iso_now() -> str:
-    return datetime.now(tz=UTC).isoformat()
+def _struct_from_dict(payload: dict[str, Any]) -> Struct:
+    return ParseDict(payload, Struct())
 
 
-def _text_part(text: str) -> dict[str, Any]:
-    return {"kind": "text", "text": text}
+def _data_payload_from_message(message: Message) -> dict[str, Any] | None:
+    for part in message.parts:
+        if part.HasField("data"):
+            payload = MessageToDict(part.data)
+            if isinstance(payload, dict):
+                return payload
+    return None
 
 
-def _data_part(data: dict[str, Any]) -> dict[str, Any]:
-    return {"kind": "data", "data": data}
+def _text_from_message(message: Message) -> str | None:
+    for part in message.parts:
+        if part.HasField("text"):
+            text = part.text.strip()
+            if text:
+                return text
+    return None
 
 
-def _message(role: str, parts: list[dict[str, Any]], *, task_id: str | None = None) -> dict[str, Any]:
-    message: dict[str, Any] = {
-        "kind": "message",
-        "messageId": str(uuid.uuid4()),
-        "role": role,
-        "parts": parts,
-    }
-    if task_id:
-        message["taskId"] = task_id
-    return message
+def _metadata_for_action(action: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(metadata)
+    enriched.setdefault("action", action)
+    return enriched
 
 
-def _artifact(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "artifactId": str(uuid.uuid4()),
-        "name": "cider-agent-result",
-        "parts": [_data_part(payload)],
-    }
-
-
-@dataclass
-class TaskStore:
-    """In-memory task snapshots used by the A2A transport."""
-
-    tasks: dict[str, dict[str, Any]]
-
-    def __init__(self) -> None:
-        self.tasks = {}
-
-    def save(self, task: dict[str, Any]) -> dict[str, Any]:
-        self.tasks[task["id"]] = task
-        return task
-
-    def get(self, task_id: str) -> dict[str, Any] | None:
-        return self.tasks.get(task_id)
-
-    def list(self) -> list[dict[str, Any]]:
-        return list(self.tasks.values())
-
-
-TASK_STORE = TaskStore()
-
-
-def build_agent_card() -> dict[str, Any]:
-    settings = get_settings()
-    return {
-        "protocolVersion": "1.0.0",
-        "name": "Cider Agent",
-        "description": "A dedicated music control agent for Cider. The intended interface is plain-language requests over A2A text messages.",
-        "url": f"{settings.public_base_url}/a2a",
-        "preferredTransport": "JSONRPC",
-        "capabilities": {
-            "streaming": True,
-            "pushNotifications": False,
-            "stateTransitionHistory": True,
-        },
-        "defaultInputModes": ["text/plain", "application/json"],
-        "defaultOutputModes": ["application/json", "text/plain"],
-        "skills": [
-            {
-                "id": "natural-language-music-control",
-                "name": "Natural-Language Music Control",
-                "description": "Send plain-language music requests like 'play upbeat morning music', 'more pop', or 'what's playing?'.",
-                "tags": ["audio", "playback", "music"],
-                "examples": ["Play upbeat morning music", "I don't like this", "Play some music"],
-                "inputModes": ["text/plain"],
-                "outputModes": ["application/json", "text/plain"],
-            },
-            {
-                "id": "advanced-structured-actions",
-                "name": "Advanced Structured Actions",
-                "description": "Structured action payloads are intentionally limited to the small public playback and preference surface; use natural-language text requests for everything else.",
-                "tags": ["advanced", "structured", "integration"],
-                "examples": ["Play", "Pause", "Stop", "List preferences"],
-                "inputModes": ["application/json", "text/plain"],
-                "outputModes": ["application/json"],
-            },
+def _agent_message(
+    *,
+    text: str,
+    payload: dict[str, Any],
+    context_id: str,
+    task_id: str,
+    metadata: dict[str, Any],
+) -> Message:
+    return Message(
+        role=Role.ROLE_AGENT,
+        message_id=str(uuid.uuid4()),
+        context_id=context_id,
+        task_id=task_id,
+        parts=[
+            new_text_part(text, media_type="text/plain"),
+            new_data_part(payload, media_type="application/json"),
         ],
-    }
+        metadata=_struct_from_dict(metadata),
+    )
 
 
-def _jsonrpc_response(request_id: Any, *, result: Any = None, error: dict[str, Any] | None = None) -> JSONResponse:
-    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
-    if error is not None:
-        payload["error"] = error
-    else:
-        payload["result"] = result
-    return JSONResponse(payload)
+@dataclass(frozen=True)
+class RequestInspection:
+    kind: str
+    read_only: bool
+    action: str | None = None
+    parameters: dict[str, Any] | None = None
+    text: str | None = None
+    public_action: bool = True
 
 
-def _jsonrpc_error(code: int, message: str, data: Any = None) -> dict[str, Any]:
-    payload = {"code": code, "message": message}
-    if data is not None:
-        payload["data"] = data
-    return payload
+@dataclass(frozen=True)
+class ExecutionResult:
+    action: str
+    payload: dict[str, Any]
+    metadata: dict[str, Any]
+    summary: str
 
 
-def _is_read_only_action(action: str) -> bool:
-    definition = get_action_definition(action)
-    return bool(definition and definition.read_only)
+def build_agent_card() -> AgentCard:
+    settings = get_settings()
+    return AgentCard(
+        name="Cider Agent",
+        description="A dedicated music control agent for Cider. The intended interface is plain-language requests over A2A text messages.",
+        version="0.1.0",
+        supported_interfaces=[
+            AgentInterface(
+                url=f"{settings.public_base_url}/a2a",
+                protocol_binding=TransportProtocol.JSONRPC.value,
+                protocol_version=PROTOCOL_VERSION_1_0,
+            ),
+            AgentInterface(
+                url=settings.public_base_url,
+                protocol_binding=TransportProtocol.HTTP_JSON.value,
+                protocol_version=PROTOCOL_VERSION_1_0,
+            ),
+        ],
+        capabilities=AgentCapabilities(
+            streaming=True,
+            push_notifications=False,
+            extended_agent_card=False,
+        ),
+        default_input_modes=["text/plain", "application/json"],
+        default_output_modes=["application/json", "text/plain"],
+        skills=[
+            AgentSkill(
+                id="natural-language-music-control",
+                name="Natural-Language Music Control",
+                description="Send plain-language music requests like 'play upbeat morning music', 'more pop', or 'what's playing?'.",
+                tags=["audio", "playback", "music"],
+                examples=["Play upbeat morning music", "I don't like this", "Play some music"],
+                input_modes=["text/plain"],
+                output_modes=["application/json", "text/plain"],
+            ),
+            AgentSkill(
+                id="advanced-structured-actions",
+                name="Advanced Structured Actions",
+                description="Structured action payloads are intentionally limited to the small public playback and preference surface; use natural-language text requests for everything else.",
+                tags=["advanced", "structured", "integration"],
+                examples=["Play", "Pause", "Stop", "List preferences"],
+                input_modes=["application/json", "text/plain"],
+                output_modes=["application/json"],
+            ),
+        ],
+    )
 
 
-def _is_read_only_text_request(text: str) -> bool:
-    definition = match_text_action_definition(text)
-    return bool(definition and definition.read_only)
+def _inspect_message(message: Message) -> RequestInspection:
+    payload = _data_payload_from_message(message)
+    if payload is not None:
+        action = str(payload.get("action", "")).strip()
+        if not action:
+            raise CiderValidationError("Data part must include a non-empty action.")
+        parameters = payload.get("parameters", {})
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict):
+            raise CiderValidationError("parameters must be an object.")
+        definition = get_action_definition(action)
+        return RequestInspection(
+            kind="action",
+            action=action,
+            parameters=parameters,
+            read_only=bool(definition and definition.read_only),
+            public_action=is_public_action(action),
+        )
 
+    text = _text_from_message(message)
+    if text is not None:
+        definition = match_text_action_definition(text)
+        return RequestInspection(
+            kind="text",
+            text=text,
+            read_only=bool(definition and definition.read_only),
+        )
 
-def _should_defer_message(message: dict[str, Any]) -> bool:
-    parts = message.get("parts", [])
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        if part.get("kind") == "data" and isinstance(part.get("data"), dict):
-            action = str(part["data"].get("action", "")).strip()
-            return not _is_read_only_action(action)
-        if part.get("kind") == "text":
-            return not _is_read_only_text_request(str(part.get("text", "")))
-    return False
-
-
-def _resolve_defer_mode(message: dict[str, Any], params: dict[str, Any]) -> bool:
-    explicit = params.get("defer")
-    if isinstance(explicit, bool):
-        return explicit
-    return _should_defer_message(message)
-
-
-def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[str, Any], Any | None]:
-    parts = message.get("parts", [])
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        if part.get("kind") == "data" and isinstance(part.get("data"), dict):
-            payload = dict(part["data"])
-            action = str(payload.get("action", "")).strip()
-            if not action:
-                raise CiderValidationError("Data part must include a non-empty action.")
-            if not is_public_action(action):
-                raise CiderValidationError(
-                    f"Structured action '{action}' is not publicly exposed. Use a plain-language text request instead."
-                )
-            parameters = payload.get("parameters", {})
-            if parameters is None:
-                parameters = {}
-            if not isinstance(parameters, dict):
-                raise CiderValidationError("parameters must be an object.")
-            return action, parameters, None
-        if part.get("kind") == "text":
-            resolved = service.execute_text_request(str(part.get("text", "")))
-            return resolved.execution.action, resolved.execution.result, resolved
     raise CiderValidationError("Message did not include a supported text or data part.")
 
 
-def _task_from_result(
-    *,
-    task_id: str,
-    context_id: str,
-    request_message: dict[str, Any],
-    action: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    summary = payload.get("summary") if isinstance(payload, dict) else None
-    message_text = str(summary).strip() if isinstance(summary, str) and summary.strip() else f"Completed action '{action}'."
-    return {
-        "kind": "task",
-        "id": task_id,
-        "contextId": context_id,
-        "status": {
-            "state": "completed",
-            "timestamp": _iso_now(),
-            "message": _message(
-                "agent",
-                [_text_part(message_text), _data_part(payload)],
-                task_id=task_id,
-            ),
-        },
-        "artifacts": [_artifact(payload)],
-        "history": [
-            request_message,
-            _message("agent", [_text_part(message_text), _data_part(payload)], task_id=task_id),
-        ],
-        "metadata": {"action": action, "summary": message_text},
-    }
-
-
-def _submitted_task(*, task_id: str, context_id: str, request_message: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "kind": "task",
-        "id": task_id,
-        "contextId": context_id,
-        "status": {
-            "state": "submitted",
-            "timestamp": _iso_now(),
-            "message": _message(
-                "agent",
-                [_text_part("Request accepted."), _data_part({"status": "submitted"})],
-                task_id=task_id,
-            ),
-        },
-        "artifacts": [],
-        "history": [
-            request_message,
-            _message("agent", [_text_part("Request accepted."), _data_part({"status": "submitted"})], task_id=task_id),
-        ],
-        "metadata": {"summary": "Request accepted."},
-    }
-
-
-def _failed_task(
-    *,
-    task: dict[str, Any],
-    message: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    task["status"] = {
-        "state": "failed",
-        "timestamp": _iso_now(),
-        "message": _message(
-            "agent",
-            [_text_part(message), _data_part(payload or {"status": "error", "message": message})],
-            task_id=task["id"],
-        ),
-    }
-    if payload is not None:
-        task["artifacts"] = [_artifact(payload)]
-    task["history"].append(
-        _message(
-            "agent",
-            [_text_part(message), _data_part(payload or {"status": "error", "message": message})],
-            task_id=task["id"],
-        )
-    )
-    task["metadata"]["summary"] = message
-    return task
-
-
-def _execute_message(message: dict[str, Any], *, task_id: str | None = None, context_id: str | None = None) -> dict[str, Any]:
+def _execute_inspection(inspection: RequestInspection) -> ExecutionResult:
     service = get_service()
-    action, parameters, resolved = _extract_action(message, service)
-    resolved_task_id = task_id or str(uuid.uuid4())
-    resolved_context_id = context_id or str(uuid.uuid4())
-    if resolved is not None:
+    if inspection.kind == "text":
+        resolved = service.execute_text_request(inspection.text or "")
         payload, metadata = render_text_result_for_a2a(resolved)
+        action = resolved.execution.action
     else:
-        payload, metadata = render_action_result_for_a2a(service.execute_action(action, parameters))
-    task = _task_from_result(
-        task_id=resolved_task_id,
-        context_id=resolved_context_id,
-        request_message=message,
-        action=action,
-        payload=payload,
-    )
-    task["metadata"].update(metadata)
-    TASK_STORE.save(task)
-    return task
+        if not inspection.public_action:
+            raise CiderValidationError(
+                f"Structured action '{inspection.action}' is not publicly exposed. Use a plain-language text request instead."
+            )
+        action = inspection.action or ""
+        payload, metadata = render_action_result_for_a2a(service.execute_action(action, inspection.parameters or {}))
+
+    metadata = _metadata_for_action(action, metadata)
+    summary = str(metadata.get("summary", "")).strip() or str(payload.get("summary", "")).strip() or f"Completed action '{action}'."
+    metadata["summary"] = summary
+    return ExecutionResult(action=action, payload=payload, metadata=metadata, summary=summary)
 
 
-def _complete_submitted_task(task: dict[str, Any], completed: dict[str, Any]) -> dict[str, Any]:
-    task["status"] = completed["status"]
-    task["artifacts"] = completed["artifacts"]
-    task["history"] = completed["history"]
-    task["metadata"].update(completed.get("metadata", {}))
-    return task
+class CiderAgentExecutor(AgentExecutor):
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        message = context.message
+        if message is None:
+            raise InvalidParamsError("SendMessageRequest.message is required.")
 
+        task_id = context.task_id
+        context_id = context.context_id
+        if not task_id or not context_id:
+            raise InternalError("Request context did not include task identifiers.")
 
-async def _execute_message_background(message: dict[str, Any], *, task_id: str, context_id: str) -> None:
-    try:
-        completed = await asyncio.to_thread(
-            _execute_message,
-            message,
+        try:
+            inspection = _inspect_message(message)
+        except CiderValidationError as exc:
+            raise InvalidParamsError(str(exc)) from exc
+
+        if inspection.kind == "action" and not inspection.public_action:
+            await self._reject_hidden_action(
+                event_queue=event_queue,
+                message=message,
+                task_id=task_id,
+                context_id=context_id,
+                action=inspection.action or "",
+            )
+            return
+
+        await self._run_task(
+            inspection,
+            event_queue=event_queue,
+            message=message,
             task_id=task_id,
             context_id=context_id,
         )
-    except TextRequestExecutionError as exc:
-        task = TASK_STORE.get(task_id)
-        if task is None:
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        task_id = context.task_id
+        context_id = context.context_id
+        if not task_id or not context_id:
+            raise InternalError("Cancellation request did not include task identifiers.")
+
+        updater = TaskUpdater(event_queue=event_queue, task_id=task_id, context_id=context_id)
+        message = _agent_message(
+            text="Request canceled.",
+            payload={"status": "error", "message": "Request canceled."},
+            context_id=context_id,
+            task_id=task_id,
+            metadata={"summary": "Request canceled."},
+        )
+        await updater.update_status(
+            TaskState.TASK_STATE_CANCELED,
+            message=message,
+            metadata={"summary": "Request canceled."},
+        )
+
+    async def _run_task(
+        self,
+        inspection: RequestInspection,
+        *,
+        event_queue: EventQueue,
+        message: Message,
+        task_id: str,
+        context_id: str,
+    ) -> None:
+        submitted = new_task(
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_SUBMITTED,
+            history=[message],
+        )
+        submitted.status.message.CopyFrom(
+            _agent_message(
+                text="Request accepted.",
+                payload={"status": "submitted"},
+                context_id=context_id,
+                task_id=task_id,
+                metadata={"summary": "Request accepted."},
+            )
+        )
+        submitted.metadata.CopyFrom(_struct_from_dict({"summary": "Request accepted."}))
+        await event_queue.enqueue_event(submitted)
+
+        updater = TaskUpdater(event_queue=event_queue, task_id=task_id, context_id=context_id)
+        await updater.start_work(
+            message=_agent_message(
+                text="Working on request.",
+                payload={"status": "working"},
+                context_id=context_id,
+                task_id=task_id,
+                metadata={"summary": "Working on request."},
+            )
+        )
+
+        try:
+            result = _execute_inspection(inspection)
+        except TextRequestExecutionError as exc:
+            payload = dict(exc.payload)
+            agent_message = _agent_message(
+                text=str(exc),
+                payload=payload,
+                context_id=context_id,
+                task_id=task_id,
+                metadata={"summary": str(exc)},
+            )
+            await updater.update_status(
+                TaskState.TASK_STATE_FAILED,
+                message=agent_message,
+                metadata={"summary": str(exc)},
+            )
             return
-        TASK_STORE.save(_failed_task(task=task, message=str(exc), payload=exc.payload))
-        return
-    except CiderAgentError as exc:
-        task = TASK_STORE.get(task_id)
-        if task is None:
+        except CiderAgentError as exc:
+            agent_message = _agent_message(
+                text=str(exc),
+                payload={"status": "error", "message": str(exc)},
+                context_id=context_id,
+                task_id=task_id,
+                metadata={"summary": str(exc)},
+            )
+            await updater.update_status(
+                TaskState.TASK_STATE_FAILED,
+                message=agent_message,
+                metadata={"summary": str(exc)},
+            )
             return
-        TASK_STORE.save(_failed_task(task=task, message=str(exc)))
-        return
-    task = TASK_STORE.get(task_id)
-    if task is None:
-        return
-    TASK_STORE.save(_complete_submitted_task(task, completed))
+
+        await updater.add_artifact(
+            parts=[new_data_part(result.payload, media_type="application/json")],
+            name="cider-agent-result",
+            metadata=result.metadata,
+        )
+        await updater.update_status(
+            TaskState.TASK_STATE_COMPLETED,
+            message=_agent_message(
+                text=result.summary,
+                payload=result.payload,
+                context_id=context_id,
+                task_id=task_id,
+                metadata=result.metadata,
+            ),
+            metadata=result.metadata,
+        )
+
+    async def _reject_hidden_action(
+        self,
+        *,
+        event_queue: EventQueue,
+        message: Message,
+        task_id: str,
+        context_id: str,
+        action: str,
+    ) -> None:
+        rejection = f"Structured action '{action}' is not publicly exposed. Use a plain-language text request instead."
+        task = new_task(
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_SUBMITTED,
+            history=[message],
+        )
+        task.metadata.CopyFrom(_struct_from_dict({"summary": rejection, "action": action}))
+        await event_queue.enqueue_event(task)
+
+        updater = TaskUpdater(event_queue=event_queue, task_id=task_id, context_id=context_id)
+        await updater.update_status(
+            TaskState.TASK_STATE_REJECTED,
+            message=_agent_message(
+                text=rejection,
+                payload={"status": "error", "message": rejection},
+                context_id=context_id,
+                task_id=task_id,
+                metadata={"summary": rejection, "action": action},
+            ),
+            metadata={"summary": rejection, "action": action},
+        )
 
 
 @asynccontextmanager
@@ -342,155 +401,17 @@ def create_a2a_app() -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/.well-known/agent.json")
-    async def agent_card_json() -> dict[str, Any]:
-        return build_agent_card()
-
-    @app.get("/.well-known/agent-card.json")
-    async def agent_card_alias() -> dict[str, Any]:
-        return build_agent_card()
-
-    @app.post("/a2a")
-    async def a2a_rpc(request: Request):
-        body = await request.json()
-        request_id = body.get("id")
-        method = body.get("method")
-        params = body.get("params", {}) or {}
-        try:
-            if body.get("jsonrpc") != "2.0":
-                return _jsonrpc_response(request_id, error=_jsonrpc_error(-32600, "jsonrpc must be '2.0'."))
-            if method == "message/send":
-                message = params.get("message")
-                if not isinstance(message, dict):
-                    raise CiderValidationError("message/send requires params.message.")
-                resolved_task_id = str(params.get("taskId") or uuid.uuid4())
-                resolved_context_id = str(message.get("contextId") or params.get("contextId") or uuid.uuid4())
-                if _resolve_defer_mode(message, params):
-                    task = _submitted_task(
-                        task_id=resolved_task_id,
-                        context_id=resolved_context_id,
-                        request_message=message,
-                    )
-                    TASK_STORE.save(task)
-                    asyncio.create_task(
-                        _execute_message_background(
-                            message,
-                            task_id=resolved_task_id,
-                            context_id=resolved_context_id,
-                        )
-                    )
-                else:
-                    task = _execute_message(
-                        message,
-                        task_id=resolved_task_id,
-                        context_id=resolved_context_id,
-                    )
-                return _jsonrpc_response(request_id, result=task)
-            if method == "message/stream":
-                message = params.get("message")
-                if not isinstance(message, dict):
-                    raise CiderValidationError("message/stream requires params.message.")
-                resolved_task_id = str(params.get("taskId") or uuid.uuid4())
-                resolved_context_id = str(message.get("contextId") or params.get("contextId") or uuid.uuid4())
-                deferred = _resolve_defer_mode(message, params)
-                if deferred:
-                    task = _submitted_task(
-                        task_id=resolved_task_id,
-                        context_id=resolved_context_id,
-                        request_message=message,
-                    )
-                    TASK_STORE.save(task)
-                    asyncio.create_task(
-                        _execute_message_background(
-                            message,
-                            task_id=resolved_task_id,
-                            context_id=resolved_context_id,
-                        )
-                    )
-                else:
-                    task = _execute_message(
-                        message,
-                        task_id=resolved_task_id,
-                        context_id=resolved_context_id,
-                    )
-
-                async def event_stream():
-                    submitted = {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "kind": "status-update",
-                            "taskId": task["id"],
-                            "contextId": task["contextId"],
-                            "status": {
-                                "state": "submitted",
-                                "timestamp": _iso_now(),
-                            },
-                            "final": False,
-                        },
-                    }
-                    yield f"data: {json.dumps(submitted)}\n\n"
-                    if deferred:
-                        while True:
-                            await asyncio.sleep(0.1)
-                            current = TASK_STORE.get(task["id"])
-                            if current is None:
-                                continue
-                            if current["status"]["state"] in {"completed", "failed", "cancelled", "rejected"}:
-                                task.update(current)
-                                break
-                    else:
-                        await asyncio.sleep(0)
-                    completed = {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "kind": "status-update",
-                            "taskId": task["id"],
-                            "contextId": task["contextId"],
-                            "status": task["status"],
-                            "artifact": task["artifacts"][0],
-                            "final": True,
-                        },
-                    }
-                    yield f"data: {json.dumps(completed)}\n\n"
-
-                return StreamingResponse(event_stream(), media_type="text/event-stream")
-            if method == "tasks/get":
-                task_id = str(params.get("id", "")).strip()
-                task = TASK_STORE.get(task_id)
-                if task is None:
-                    return _jsonrpc_response(request_id, error=_jsonrpc_error(-32004, "Task not found."))
-                return _jsonrpc_response(request_id, result=task)
-            if method == "tasks/cancel":
-                task_id = str(params.get("id", "")).strip()
-                task = TASK_STORE.get(task_id)
-                if task is None:
-                    return _jsonrpc_response(request_id, error=_jsonrpc_error(-32004, "Task not found."))
-                if task["status"]["state"] in {"completed", "failed", "cancelled", "rejected"}:
-                    return _jsonrpc_response(request_id, result=task)
-                task["status"] = {"state": "cancelled", "timestamp": _iso_now()}
-                TASK_STORE.save(task)
-                return _jsonrpc_response(request_id, result=task)
-            if method == "tasks/list":
-                tasks = TASK_STORE.list()
-                return _jsonrpc_response(
-                    request_id,
-                    result={
-                        "tasks": tasks,
-                        "nextPageToken": "",
-                        "pageSize": len(tasks),
-                        "totalSize": len(tasks),
-                    },
-                )
-            return _jsonrpc_response(request_id, error=_jsonrpc_error(-32601, f"Unknown method: {method}"))
-        except TextRequestExecutionError as exc:
-            return _jsonrpc_response(request_id, error=_jsonrpc_error(-32000, str(exc), data=exc.payload))
-        except CiderAgentError as exc:
-            return _jsonrpc_response(request_id, error=_jsonrpc_error(-32000, str(exc)))
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            return _jsonrpc_response(request_id, error=_jsonrpc_error(-32603, f"Internal error: {exc}"))
-
+    handler = DefaultRequestHandlerV2(
+        agent_executor=CiderAgentExecutor(),
+        task_store=InMemoryTaskStore(),
+        agent_card=build_agent_card(),
+    )
+    add_a2a_routes_to_fastapi(
+        app,
+        agent_card_routes=create_agent_card_routes(build_agent_card(), card_url=AGENT_CARD_WELL_KNOWN_PATH),
+        jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/a2a"),
+        rest_routes=create_rest_routes(handler),
+    )
     return app
 
 

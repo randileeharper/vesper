@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+from google.protobuf.json_format import MessageToDict
 
 from .results import EngineActionResult, TextRequestResult
+
+if TYPE_CHECKING:
+    from a2a.types import Message, Task
 
 
 def render_text_result_for_a2a(result: TextRequestResult) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -34,9 +39,9 @@ def render_action_result_for_a2a(result: EngineActionResult) -> tuple[dict[str, 
     }
 
 
-def render_task_payload_for_cli(task: dict[str, Any], *, original_text: str | None = None) -> dict[str, Any]:
-    payload = _extract_task_payload(task)
-    metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+def render_task_payload_for_cli(task: Any, *, original_text: str | None = None) -> dict[str, Any]:
+    payload = _extract_payload(task)
+    metadata = _extract_metadata(task)
     action = metadata.get("action")
     if original_text is None:
         return payload
@@ -67,12 +72,38 @@ def _extract_data_part(parts: Any) -> dict[str, Any] | None:
     if not isinstance(parts, list):
         return None
     for part in parts:
-        if isinstance(part, dict) and part.get("kind") == "data" and isinstance(part.get("data"), dict):
+        if isinstance(part, dict) and isinstance(part.get("data"), dict):
             return dict(part["data"])
     return None
 
 
-def _extract_task_payload(task: dict[str, Any]) -> dict[str, Any]:
+def _proto_to_dict(message: Any) -> dict[str, Any]:
+    return MessageToDict(message, preserving_proto_field_name=False)
+
+
+def _extract_metadata(result: Any) -> dict[str, Any]:
+    if _is_proto_message(result):
+        payload = _proto_to_dict(result)
+    else:
+        payload = result
+    metadata = payload.get("metadata", {})
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _extract_payload(result: Any) -> dict[str, Any]:
+    if _looks_like_message(result):
+        payload = _extract_data_part(_proto_to_dict(result).get("parts", []))
+        if payload is not None:
+            return payload
+        raise ValueError("Message did not include a data part.")
+
+    if _looks_like_task(result):
+        return _extract_task_payload_dict(_proto_to_dict(result))
+
+    return _extract_task_payload_dict(result)
+
+
+def _extract_task_payload_dict(task: dict[str, Any]) -> dict[str, Any]:
     artifacts = task.get("artifacts", [])
     if isinstance(artifacts, list):
         for artifact in artifacts:
@@ -81,4 +112,25 @@ def _extract_task_payload(task: dict[str, Any]) -> dict[str, Any]:
             payload = _extract_data_part(artifact.get("parts", []))
             if payload is not None:
                 return payload
+
+    status = task.get("status", {})
+    if isinstance(status, dict):
+        message = status.get("message", {})
+        if isinstance(message, dict):
+            payload = _extract_data_part(message.get("parts", []))
+            if payload is not None:
+                return payload
+
     raise ValueError("Task did not include a data artifact.")
+
+
+def _is_proto_message(value: Any) -> bool:
+    return hasattr(value, "DESCRIPTOR")
+
+
+def _looks_like_message(value: Any) -> bool:
+    return _is_proto_message(value) and hasattr(value, "parts") and hasattr(value, "role")
+
+
+def _looks_like_task(value: Any) -> bool:
+    return _is_proto_message(value) and hasattr(value, "status") and hasattr(value, "artifacts")
