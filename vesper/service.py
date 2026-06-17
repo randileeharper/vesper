@@ -1,4 +1,4 @@
-"""Domain services for cider_agent."""
+"""Domain services for Vesper."""
 
 from __future__ import annotations
 
@@ -250,7 +250,7 @@ class CiderAgentService:
             self._session_worker_stop.clear()
             self._session_worker_thread = threading.Thread(
                 target=self._session_worker_loop,
-                name="cider-agent-session-worker",
+                name="vesper-session-worker",
                 daemon=True,
             )
             self._session_worker_thread.start()
@@ -266,7 +266,7 @@ class CiderAgentService:
     def status(self) -> dict[str, Any]:
         payload = {
             "status": "ok",
-            "source": "cider-agent",
+            "source": "vesper",
             "config": self._settings.sanitized(),
             "playback": self.playback_snapshot(),
             "preferences_count": len(self._preferences.list_preferences()),
@@ -276,7 +276,7 @@ class CiderAgentService:
             session = self._preferences.get_active_session()
             return {
                 "status": "ok",
-                "source": "cider-agent",
+                "source": "vesper",
                 "playback": {
                     "is_playing": payload["playback"].get("is_playing"),
                     "track": self._compact_track(payload["playback"].get("track", {})),

@@ -1,4 +1,4 @@
-"""Thin transport renderers for cider_agent."""
+"""Thin transport renderers for Vesper."""
 
 from __future__ import annotations
 

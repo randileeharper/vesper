@@ -1,4 +1,4 @@
-"""Allow `python -m cider_agent` to run the CLI."""
+"""Allow `python -m vesper` to run the CLI."""
 
 from .cli import main
 

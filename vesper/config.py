@@ -1,4 +1,4 @@
-"""Configuration loading for cider_agent."""
+"""Configuration loading for Vesper."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 from .errors import CiderConfigError
 
 
-CONFIG_ENV_VAR = "CIDER_AGENT_CONFIG_PATH"
+CONFIG_ENV_VAR = "VESPER_CONFIG_PATH"
 
 
 def _env_path(name: str) -> Path | None:
@@ -31,7 +31,7 @@ def _default_config_paths() -> list[Path]:
     if explicit is not None:
         paths.append(explicit)
     paths.append(Path.cwd() / "config.json")
-    paths.append(_xdg_config_home() / "cider-agent" / "config.json")
+    paths.append(_xdg_config_home() / "vesper" / "config.json")
     return paths
 
 
@@ -71,7 +71,7 @@ def _as_bool(value: Any) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    """Runtime settings for cider_agent."""
+    """Runtime settings for Vesper."""
 
     http_host: str = "127.0.0.1"
     http_port: int = 8766
@@ -93,37 +93,37 @@ class Settings:
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
     log_level: str = "INFO"
-    database_path: Path = Path("~/.local/share/cider-agent/cider-agent.db").expanduser()
+    database_path: Path = Path("~/.local/share/vesper/vesper.db").expanduser()
     config_path: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
         config, config_path = _load_json_config()
 
-        http_host = str(_config_or_env(config, "CIDER_AGENT_HTTP_HOST", "http_host", "127.0.0.1")).strip()
-        http_port = int(_config_or_env(config, "CIDER_AGENT_HTTP_PORT", "http_port", 8766))
+        http_host = str(_config_or_env(config, "VESPER_HTTP_HOST", "http_host", "127.0.0.1")).strip()
+        http_port = int(_config_or_env(config, "VESPER_HTTP_PORT", "http_port", 8766))
         public_base_url = str(
-            _config_or_env(config, "CIDER_AGENT_PUBLIC_BASE_URL", "public_base_url", f"http://{http_host}:{http_port}")
+            _config_or_env(config, "VESPER_PUBLIC_BASE_URL", "public_base_url", f"http://{http_host}:{http_port}")
         ).strip().rstrip("/")
         cider_base_url = str(
-            _config_or_env(config, "CIDER_AGENT_CIDER_BASE_URL", "cider_base_url", "http://localhost:10767")
+            _config_or_env(config, "VESPER_CIDER_BASE_URL", "cider_base_url", "http://localhost:10767")
         ).strip().rstrip("/")
-        cider_api_token_raw = _config_or_env(config, "CIDER_AGENT_CIDER_API_TOKEN", "cider_api_token")
+        cider_api_token_raw = _config_or_env(config, "VESPER_CIDER_API_TOKEN", "cider_api_token")
         default_search_source = str(
-            _config_or_env(config, "CIDER_AGENT_DEFAULT_SEARCH_SOURCE", "default_search_source", "catalog")
+            _config_or_env(config, "VESPER_DEFAULT_SEARCH_SOURCE", "default_search_source", "catalog")
         ).strip().lower()
         resolver_backend = str(
-            _config_or_env(config, "CIDER_AGENT_RESOLVER_BACKEND", "resolver_backend", "fallback")
+            _config_or_env(config, "VESPER_RESOLVER_BACKEND", "resolver_backend", "fallback")
         ).strip().lower()
         resolver_base_url = str(
-            _config_or_env(config, "CIDER_AGENT_RESOLVER_BASE_URL", "resolver_base_url", "https://api.openai.com/v1")
+            _config_or_env(config, "VESPER_RESOLVER_BASE_URL", "resolver_base_url", "https://api.openai.com/v1")
         ).strip().rstrip("/")
-        resolver_model_raw = _config_or_env(config, "CIDER_AGENT_RESOLVER_MODEL", "resolver_model")
-        resolver_api_key_raw = _config_or_env(config, "CIDER_AGENT_RESOLVER_API_KEY", "resolver_api_key")
+        resolver_model_raw = _config_or_env(config, "VESPER_RESOLVER_MODEL", "resolver_model")
+        resolver_api_key_raw = _config_or_env(config, "VESPER_RESOLVER_API_KEY", "resolver_api_key")
         resolver_include_reasoning = _as_bool(
             _config_or_env(
                 config,
-                "CIDER_AGENT_RESOLVER_INCLUDE_REASONING",
+                "VESPER_RESOLVER_INCLUDE_REASONING",
                 "resolver_include_reasoning",
                 False,
             )
@@ -131,20 +131,20 @@ class Settings:
         resolver_include_raw_output = _as_bool(
             _config_or_env(
                 config,
-                "CIDER_AGENT_RESOLVER_INCLUDE_RAW_OUTPUT",
+                "VESPER_RESOLVER_INCLUDE_RAW_OUTPUT",
                 "resolver_include_raw_output",
                 False,
             )
         )
         resolver_debug_log_path_raw = _config_or_env(
             config,
-            "CIDER_AGENT_RESOLVER_DEBUG_LOG_PATH",
+            "VESPER_RESOLVER_DEBUG_LOG_PATH",
             "resolver_debug_log_path",
         )
         include_timing_debug = _as_bool(
             _config_or_env(
                 config,
-                "CIDER_AGENT_INCLUDE_TIMING_DEBUG",
+                "VESPER_INCLUDE_TIMING_DEBUG",
                 "include_timing_debug",
                 False,
             )
@@ -152,7 +152,7 @@ class Settings:
         response_detail = str(
             _config_or_env(
                 config,
-                "CIDER_AGENT_RESPONSE_DETAIL",
+                "VESPER_RESPONSE_DETAIL",
                 "response_detail",
                 "compact",
             )
@@ -160,7 +160,7 @@ class Settings:
         session_recent_tracks_limit = int(
             _config_or_env(
                 config,
-                "CIDER_AGENT_SESSION_RECENT_TRACKS_LIMIT",
+                "VESPER_SESSION_RECENT_TRACKS_LIMIT",
                 "session_recent_tracks_limit",
                 10,
             )
@@ -168,23 +168,23 @@ class Settings:
         global_recent_tracks_limit = int(
             _config_or_env(
                 config,
-                "CIDER_AGENT_GLOBAL_RECENT_TRACKS_LIMIT",
+                "VESPER_GLOBAL_RECENT_TRACKS_LIMIT",
                 "global_recent_tracks_limit",
                 10,
             )
         )
         request_timeout_seconds = float(
-            _config_or_env(config, "CIDER_AGENT_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 60.0)
+            _config_or_env(config, "VESPER_REQUEST_TIMEOUT_SECONDS", "request_timeout_seconds", 60.0)
         )
-        verify_tls = _as_bool(_config_or_env(config, "CIDER_AGENT_VERIFY_TLS", "verify_tls", True))
-        log_level = str(_config_or_env(config, "CIDER_AGENT_LOG_LEVEL", "log_level", "INFO")).strip().upper()
+        verify_tls = _as_bool(_config_or_env(config, "VESPER_VERIFY_TLS", "verify_tls", True))
+        log_level = str(_config_or_env(config, "VESPER_LOG_LEVEL", "log_level", "INFO")).strip().upper()
         database_path = Path(
             str(
                 _config_or_env(
                     config,
-                    "CIDER_AGENT_DATABASE_PATH",
+                    "VESPER_DATABASE_PATH",
                     "database_path",
-                    "~/.local/share/cider-agent/cider-agent.db",
+                    "~/.local/share/vesper/vesper.db",
                 )
             )
         ).expanduser()

@@ -1,4 +1,4 @@
-"""SQLite-backed persistence for cider_agent."""
+"""SQLite-backed persistence for Vesper."""
 
 from __future__ import annotations
 

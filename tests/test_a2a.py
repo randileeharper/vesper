@@ -11,7 +11,7 @@ from a2a.helpers import new_data_part, new_text_part
 from a2a.types import CancelTaskRequest, GetTaskRequest, ListTasksRequest, Message, Role, SendMessageRequest
 from a2a.utils.constants import PROTOCOL_VERSION_1_0, VERSION_HEADER
 
-from cider_agent import a2a
+from vesper import a2a
 
 
 def _headers() -> dict[str, str]:
@@ -82,7 +82,7 @@ def test_agent_card_is_published(monkeypatch, service, settings) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["name"] == "cider"
+    assert payload["name"] == "vesper"
     assert payload["supportedInterfaces"][0]["protocolVersion"] == "1.0"
     assert payload["supportedInterfaces"][0]["url"] == "http://127.0.0.1:8766/a2a"
     assert payload["supportedInterfaces"][0]["protocolBinding"] == "JSONRPC"
@@ -94,7 +94,7 @@ def test_agent_card_alias_is_published(monkeypatch, service, settings) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["name"] == "cider"
+    assert payload["name"] == "vesper"
     assert payload["supportedInterfaces"][0]["protocolVersion"] == "1.0"
     assert payload["supportedInterfaces"][0]["url"] == "http://127.0.0.1:8766/a2a"
     assert payload["supportedInterfaces"][0]["protocolBinding"] == "JSONRPC"

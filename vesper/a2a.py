@@ -1,4 +1,4 @@
-"""HTTP transport hosting for cider_agent."""
+"""HTTP transport hosting for Vesper."""
 
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ class ExecutionResult:
 def build_agent_card() -> AgentCard:
     settings = get_settings()
     return AgentCard(
-        name="cider",
+        name="vesper",
         description="A dedicated music control agent for Cider. The intended interface is plain-language requests over A2A text messages.",
         version="0.1.0",
         supported_interfaces=[
@@ -339,7 +339,7 @@ class CiderAgentExecutor(AgentExecutor):
 
         await updater.add_artifact(
             parts=[new_data_part(result.payload, media_type="application/json")],
-            name="cider-agent-result",
+            name="vesper-result",
             metadata=result.metadata,
         )
         await updater.update_status(
@@ -414,7 +414,7 @@ def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> 
         mcp_app = mcp_server.streamable_http_app()
         mcp_endpoint = mcp_app.routes[0].endpoint
 
-    app = FastAPI(title="Cider Agent", version="0.1.0", lifespan=_create_lifespan(mcp_server.session_manager if mcp_server else None))
+    app = FastAPI(title="Vesper", version="0.1.0", lifespan=_create_lifespan(mcp_server.session_manager if mcp_server else None))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -458,7 +458,7 @@ def run_server(*, include_a2a: bool = False, include_mcp: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the cider_agent HTTP transports.")
+    parser = argparse.ArgumentParser(description="Run the Vesper HTTP transports.")
     parser.add_argument("--a2a", action="store_true", help="Enable the A2A HTTP transport.")
     parser.add_argument("--mcp", action="store_true", help="Also mount the MCP Streamable HTTP transport at /mcp.")
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-"""MCP transport for cider_agent."""
+"""MCP transport for Vesper."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ async def _mcp_lifespan(_: FastMCP):
 def create_mcp_server(*, streamable_http_path: str = "/mcp") -> FastMCP:
     settings = get_settings()
     server = FastMCP(
-        "cider-agent",
+        "vesper",
         instructions=(
             "A compact music-control MCP server for the Cider Apple Music client. "
             "Use ask for rich natural-language requests; use the transport tools for direct playback control."
@@ -61,4 +61,3 @@ def create_mcp_server(*, streamable_http_path: str = "/mcp") -> FastMCP:
         return get_service().handle_text_request(text)
 
     return server
-

@@ -1,4 +1,4 @@
-"""CLI entrypoint for cider_agent."""
+"""CLI entrypoint for Vesper."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cider-agent", description="Control Cider through cider_agent.")
+    parser = argparse.ArgumentParser(prog="vesper", description="Control Cider through Vesper.")
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -51,13 +51,14 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.command == "serve":
+            if not args.a2a and not args.mcp:
+                parser.error("serve requires at least one transport flag: --a2a and/or --mcp.")
+
             import uvicorn
 
             from .a2a import create_http_app
 
             settings = get_settings()
-            if not args.a2a and not args.mcp:
-                parser.error("serve requires at least one transport flag: --a2a and/or --mcp.")
             uvicorn.run(
                 create_http_app(include_a2a=args.a2a, include_mcp=args.mcp),
                 host=args.host or settings.http_host,

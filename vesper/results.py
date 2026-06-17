@@ -1,4 +1,4 @@
-"""Stable engine result DTOs for cider_agent."""
+"""Stable engine result DTOs for Vesper."""
 
 from __future__ import annotations
 

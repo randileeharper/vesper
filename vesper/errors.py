@@ -1,4 +1,4 @@
-"""Error types used by cider_agent."""
+"""Error types used by Vesper."""
 
 from __future__ import annotations
 

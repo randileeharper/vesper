@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from cider_agent.action_registry import get_action_definition
-from cider_agent.config import Settings
-from cider_agent.errors import CiderValidationError, TextRequestExecutionError
-from cider_agent.resolver import ResolvedAction
-from cider_agent.service import CiderAgentService
-from cider_agent.storage import PreferenceStore
+from vesper.action_registry import get_action_definition
+from vesper.config import Settings
+from vesper.errors import CiderValidationError, TextRequestExecutionError
+from vesper.resolver import ResolvedAction
+from vesper.service import CiderAgentService
+from vesper.storage import PreferenceStore
 
 
 def test_preferences_round_trip(service) -> None:

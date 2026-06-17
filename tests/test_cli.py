@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from cider_agent import cli
-from cider_agent.errors import TextRequestExecutionError
+from vesper import cli
+from vesper.errors import TextRequestExecutionError
 
 
 def test_cli_play_calls_service_directly(monkeypatch, capsys) -> None:
@@ -14,7 +14,7 @@ def test_cli_play_calls_service_directly(monkeypatch, capsys) -> None:
             return {"status": "ok", "result": {"path": "/play", "body": None}}
 
     monkeypatch.setattr(cli, "get_service", lambda: FakeService())
-    monkeypatch.setattr("sys.argv", ["cider-agent", "play"])
+    monkeypatch.setattr("sys.argv", ["vesper", "play"])
 
     cli.main()
 
@@ -29,7 +29,7 @@ def test_cli_ask_calls_service_directly(monkeypatch, capsys) -> None:
             return {"status": "ok", "input": text, "summary": "done"}
 
     monkeypatch.setattr(cli, "get_service", lambda: FakeService())
-    monkeypatch.setattr("sys.argv", ["cider-agent", "ask", "play some kep1er"])
+    monkeypatch.setattr("sys.argv", ["vesper", "ask", "play some kep1er"])
 
     cli.main()
 
@@ -43,7 +43,7 @@ def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
             raise TextRequestExecutionError("No active session.", {"status": "error", "message": "No active session."})
 
     monkeypatch.setattr(cli, "get_service", lambda: FakeService())
-    monkeypatch.setattr("sys.argv", ["cider-agent", "ask", "stop session"])
+    monkeypatch.setattr("sys.argv", ["vesper", "ask", "stop session"])
 
     with pytest.raises(SystemExit, match="1"):
         cli.main()
@@ -53,7 +53,7 @@ def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
 
 
 def test_serve_requires_transport_flag(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", ["cider-agent", "serve"])
+    monkeypatch.setattr("sys.argv", ["vesper", "serve"])
 
     with pytest.raises(SystemExit, match="2"):
         cli.main()
@@ -62,7 +62,7 @@ def test_serve_requires_transport_flag(monkeypatch) -> None:
 def test_serve_accepts_a2a_transport(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr("sys.argv", ["cider-agent", "serve", "--a2a"])
+    monkeypatch.setattr("sys.argv", ["vesper", "serve", "--a2a"])
     monkeypatch.setattr(cli, "get_settings", lambda: type("Settings", (), {"http_host": "127.0.0.1", "http_port": 8766})())
 
     def fake_create_http_app(*, include_a2a: bool, include_mcp: bool):
@@ -75,7 +75,7 @@ def test_serve_accepts_a2a_transport(monkeypatch) -> None:
         captured["port"] = port
         captured["reload"] = reload
 
-    monkeypatch.setattr("cider_agent.a2a.create_http_app", fake_create_http_app)
+    monkeypatch.setattr("vesper.a2a.create_http_app", fake_create_http_app)
     monkeypatch.setattr("uvicorn.run", fake_run)
 
     cli.main()
@@ -88,7 +88,7 @@ def test_serve_accepts_a2a_transport(monkeypatch) -> None:
 def test_serve_accepts_both_transports(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr("sys.argv", ["cider-agent", "serve", "--a2a", "--mcp"])
+    monkeypatch.setattr("sys.argv", ["vesper", "serve", "--a2a", "--mcp"])
     monkeypatch.setattr(cli, "get_settings", lambda: type("Settings", (), {"http_host": "127.0.0.1", "http_port": 8766})())
 
     def fake_create_http_app(*, include_a2a: bool, include_mcp: bool):
@@ -98,7 +98,7 @@ def test_serve_accepts_both_transports(monkeypatch) -> None:
     def fake_run(app, *, host, port, reload):
         captured["app"] = app
 
-    monkeypatch.setattr("cider_agent.a2a.create_http_app", fake_create_http_app)
+    monkeypatch.setattr("vesper.a2a.create_http_app", fake_create_http_app)
     monkeypatch.setattr("uvicorn.run", fake_run)
 
     cli.main()

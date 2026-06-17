@@ -9,11 +9,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.memory import create_connected_server_and_client_session
 import pytest
 
-from cider_agent import a2a, mcp_server
-from cider_agent.a2a import create_http_app
-from cider_agent.config import Settings
-from cider_agent.service import CiderAgentService
-from cider_agent.storage import PreferenceStore
+from vesper import a2a, mcp_server
+from vesper.a2a import create_http_app
+from vesper.config import Settings
+from vesper.service import CiderAgentService
+from vesper.storage import PreferenceStore
 from tests.conftest import StubResolver, StubRpcClient
 
 

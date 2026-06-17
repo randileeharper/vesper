@@ -1,4 +1,4 @@
-"""Text-to-action resolution for cider_agent."""
+"""Text-to-action resolution for Vesper."""
 
 from __future__ import annotations
 
@@ -276,7 +276,7 @@ class OpenAICompatibleResolver:
             "allowed_actions": self._resolver_action_specs(),
         }
         system = (
-            "You are the cider_agent request resolver. "
+            "You are the Vesper request resolver. "
             "Return exactly one JSON object with keys action and parameters. "
             "Use only an action from allowed_actions. "
             "Do not explain anything. "
@@ -309,7 +309,7 @@ class OpenAICompatibleResolver:
             "count": count,
         }
         system = (
-            "You are planning the next search request for an adaptive music session in cider_agent. "
+            "You are planning the next search request for an adaptive music session in Vesper. "
             "Return only JSON with key search_queries, containing a short list of search strings. "
             f"The session needs {count} search query right now; return exactly 1 query when possible. "
             "Honor the original session_request, steering changes, and the current timestamp. "
@@ -348,7 +348,7 @@ class OpenAICompatibleResolver:
             ],
         }
         system = (
-            "You are choosing the next track for an adaptive music session in cider_agent from real Apple Music results. "
+            "You are choosing the next track for an adaptive music session in Vesper from real Apple Music results. "
             "Return only JSON with shape {\"selected_index\": number}. "
             "Choose the single best candidate for the session request and steering. "
             "Treat session_steering as persistent cumulative session state, not a one-turn hint. "

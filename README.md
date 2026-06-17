@@ -1,6 +1,6 @@
-# Cider Agent
+# Vesper
 
-`cider_agent` is a dedicated music-control agent for the Cider Apple Music client. It exposes a local CLI for direct use, a text-first A2A interface for delegation from another agent, and a small MCP tool surface for hosts that want direct playback control plus one natural-language entrypoint.
+`Vesper` is a dedicated music-control agent for the Cider Apple Music client. It exposes a local CLI for direct use, a text-first A2A interface for delegation from another agent, and a small MCP tool surface for hosts that want direct playback control plus one natural-language entrypoint.
 
 The project is built around a simple idea: keep the main conversational agent lean, and hand off music work to a narrow specialist.
 
@@ -8,7 +8,7 @@ The project is built around a simple idea: keep the main conversational agent le
 
 Many agent harnesses assume frontier models can absorb large tool surfaces, long instruction blocks, and lots of command schema without falling apart. Smaller local models usually do worse at that. They get slower, more error-prone, and more likely to lose the thread.
 
-`cider_agent` is designed to reduce that cognitive load.
+`Vesper` is designed to reduce that cognitive load.
 
 - The conversational agent stays the main user-facing entrypoint.
 - It does not need to memorize a large music-control schema.
@@ -53,65 +53,65 @@ cp config.example.json config.json
 
 Config resolution order:
 
-1. `CIDER_AGENT_CONFIG_PATH`
+1. `VESPER_CONFIG_PATH`
 2. `./config.json`
-3. `~/.config/cider-agent/config.json`
+3. `~/.config/vesper/config.json`
 
 See `config.example.json` for the full schema. Every setting also supports an environment-variable override. The most commonly used ones are:
 
-- `CIDER_AGENT_PUBLIC_BASE_URL`
-- `CIDER_AGENT_CIDER_BASE_URL`
-- `CIDER_AGENT_CIDER_API_TOKEN`
-- `CIDER_AGENT_RESOLVER_BACKEND`
-- `CIDER_AGENT_RESOLVER_BASE_URL`
-- `CIDER_AGENT_RESOLVER_MODEL`
-- `CIDER_AGENT_RESOLVER_API_KEY`
-- `CIDER_AGENT_DATABASE_PATH`
+- `VESPER_PUBLIC_BASE_URL`
+- `VESPER_CIDER_BASE_URL`
+- `VESPER_CIDER_API_TOKEN`
+- `VESPER_RESOLVER_BACKEND`
+- `VESPER_RESOLVER_BASE_URL`
+- `VESPER_RESOLVER_MODEL`
+- `VESPER_RESOLVER_API_KEY`
+- `VESPER_DATABASE_PATH`
 
 ## Run
 
 CLI examples:
 
 ```bash
-cider-agent play
-cider-agent pause
-cider-agent stop
-cider-agent preferences list
-cider-agent preferences forget 12
-cider-agent ask "play some kep1er"
-cider-agent ask "play something upbeat for the morning"
-cider-agent ask "play some music"
-cider-agent ask "what playlists do I have?"
-cider-agent ask "play playlist Mix"
-cider-agent ask "i don't like this"
-cider-agent ask "i like this track"
+vesper play
+vesper pause
+vesper stop
+vesper preferences list
+vesper preferences forget 12
+vesper ask "play some kep1er"
+vesper ask "play something upbeat for the morning"
+vesper ask "play some music"
+vesper ask "what playlists do I have?"
+vesper ask "play playlist Mix"
+vesper ask "i don't like this"
+vesper ask "i like this track"
 ```
 
 The CLI commands work directly against the local service and do not require any HTTP server to be running.
-`cider-agent serve` requires at least one transport flag: `--a2a`, `--mcp`, or both.
+`vesper serve` requires at least one transport flag: `--a2a`, `--mcp`, or both.
 
 Start the A2A HTTP transport:
 
 ```bash
-cider-agent serve --a2a
+vesper serve --a2a
 ```
 
 Run the MCP server over stdio:
 
 ```bash
-cider-agent mcp
+vesper mcp
 ```
 
 Start the MCP HTTP transport:
 
 ```bash
-cider-agent serve --mcp
+vesper serve --mcp
 ```
 
 Run A2A and MCP together over HTTP:
 
 ```bash
-cider-agent serve --a2a --mcp
+vesper serve --a2a --mcp
 ```
 
 Common HTTP endpoint available whenever either HTTP transport is enabled:
@@ -139,7 +139,7 @@ MCP HTTP endpoint when `--mcp` is enabled:
 
 The intended integration path is plain-language text requests. Upstream conversational agents do not need to know the internal action schema. In the common case, they only need to know:
 
-- `cider_agent` exists
+- `Vesper` exists
 - it accepts natural-language music requests
 - it returns compact structured results
 
@@ -223,8 +223,8 @@ Playlist listing, playlist play-by-name, adaptive sessions, queue-aware behavior
 
 The MCP surface is intentionally smaller than the internal action registry. It is available in two forms:
 
-- stdio via `cider-agent mcp`
-- Streamable HTTP via `cider-agent serve --mcp` or `cider-agent serve --a2a --mcp`
+- stdio via `vesper mcp`
+- Streamable HTTP via `vesper serve --mcp` or `vesper serve --a2a --mcp`
 
 Exposed MCP tools:
 
@@ -242,15 +242,15 @@ Example MCP host config:
 ```json
 {
   "mcpServers": {
-    "cider-agent": {
-      "command": "cider-agent",
+    "vesper": {
+      "command": "vesper",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-When MCP is mounted over HTTP with `cider-agent serve --mcp` or `cider-agent serve --a2a --mcp`, the Streamable HTTP endpoint is:
+When MCP is mounted over HTTP with `vesper serve --mcp` or `vesper serve --a2a --mcp`, the Streamable HTTP endpoint is:
 
 ```text
 http://127.0.0.1:8766/mcp

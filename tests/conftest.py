@@ -10,11 +10,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cider_agent.config import Settings
-from cider_agent.rpc import CiderRpcClient
-from cider_agent.resolver import ResolvedAction
-from cider_agent.service import CiderAgentService
-from cider_agent.storage import PreferenceStore
+from vesper.config import Settings
+from vesper.rpc import CiderRpcClient
+from vesper.resolver import ResolvedAction
+from vesper.service import CiderAgentService
+from vesper.storage import PreferenceStore
 
 
 class FakeResponse:
@@ -404,7 +404,7 @@ def settings(tmp_path: Path) -> Settings:
         request_timeout_seconds=10.0,
         verify_tls=True,
         log_level="INFO",
-        database_path=tmp_path / "cider-agent.db",
+        database_path=tmp_path / "vesper.db",
         config_path=None,
     )
 

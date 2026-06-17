@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from cider_agent.config import Settings
+from vesper.config import Settings
 
 
 def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
@@ -25,7 +25,7 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
             ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("CIDER_AGENT_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("VESPER_CONFIG_PATH", str(config_path))
 
     settings = Settings.from_env()
 

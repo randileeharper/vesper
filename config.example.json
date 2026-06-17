@@ -10,7 +10,7 @@
   "resolver_api_key": "your-openai-compatible-key",
   "resolver_include_reasoning": false,
   "resolver_include_raw_output": false,
-  "resolver_debug_log_path": "/tmp/cider-agent-resolver.log",
+  "resolver_debug_log_path": "/tmp/vesper-resolver.log",
   "include_timing_debug": false,
   "response_detail": "compact",
   "session_recent_tracks_limit": 10,
@@ -18,5 +18,5 @@
   "request_timeout_seconds": 60.0,
   "verify_tls": true,
   "log_level": "INFO",
-  "database_path": "~/.local/share/cider-agent/cider-agent.db"
+  "database_path": "~/.local/share/vesper/vesper.db"
 }

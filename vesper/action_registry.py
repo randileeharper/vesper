@@ -1,4 +1,4 @@
-"""Central action registry for cider_agent."""
+"""Central action registry for Vesper."""
 
 from __future__ import annotations
 

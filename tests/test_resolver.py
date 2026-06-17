@@ -5,9 +5,9 @@ import json
 import httpx
 import pytest
 
-from cider_agent.config import Settings
-from cider_agent.errors import ResolverError
-from cider_agent.resolver import FallbackResolver, OpenAICompatibleResolver
+from vesper.config import Settings
+from vesper.errors import ResolverError
+from vesper.resolver import FallbackResolver, OpenAICompatibleResolver
 
 
 class FakeResolverTransport(httpx.BaseTransport):

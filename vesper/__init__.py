@@ -1,4 +1,4 @@
-"""Cider Agent package."""
+"""Vesper package."""
 
 __all__ = ["__version__"]
 
