@@ -187,6 +187,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ask = subparsers.add_parser("ask")
     ask.add_argument("text")
 
+    subparsers.add_parser("mcp")
+
     preferences = subparsers.add_parser("preferences")
     preferences_subparsers = preferences.add_subparsers(dest="preferences_command", required=True)
     preferences_subparsers.add_parser("list")
@@ -196,6 +198,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve")
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
+    serve.add_argument("--mcp", action="store_true", help="Also mount the MCP Streamable HTTP transport at /mcp.")
 
     return parser
 def main() -> None:
@@ -209,11 +212,16 @@ def main() -> None:
 
             settings = get_settings()
             uvicorn.run(
-                create_a2a_app(),
+                create_a2a_app(include_mcp=args.mcp),
                 host=args.host or settings.http_host,
                 port=args.port or settings.http_port,
                 reload=False,
             )
+            return
+        if args.command == "mcp":
+            from .mcp_server import create_mcp_server
+
+            create_mcp_server().run("stdio")
             return
 
         try:

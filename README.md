@@ -1,6 +1,7 @@
 # Cider Agent
 
 `cider_agent` is a dedicated music-control agent for the Cider Apple Music client. It exposes a text-first A2A interface for delegation from another agent, plus a local CLI for direct use.
+It also exposes a small MCP tool surface for hosts that want direct playback control plus one natural-language entrypoint.
 
 The project is built around a simple idea: keep the main conversational agent lean, and hand off music work to a narrow specialist.
 
@@ -95,6 +96,20 @@ cider-agent-serve
 cider-agent serve
 ```
 
+Run the MCP server over stdio:
+
+```bash
+cider-agent mcp
+```
+
+Run A2A and also mount MCP over HTTP:
+
+```bash
+cider-agent serve --mcp
+# or
+cider-agent-serve --mcp
+```
+
 Published endpoints:
 
 - `POST /a2a`
@@ -108,6 +123,7 @@ Published endpoints:
 - `GET /tasks/{id}:subscribe`
 - `POST /tasks/{id}:subscribe`
 - `GET /healthz`
+- `POST /mcp`
 
 ## A2A Usage
 
@@ -192,6 +208,37 @@ Structured requests should send a `data` part:
 ```
 
 Playlist listing, playlist play-by-name, adaptive sessions, queue-aware behavior, and current-track feedback are available through text requests and intentionally hidden from the public structured contract.
+
+## MCP Usage
+
+The MCP surface is intentionally smaller than the internal action registry. Exposed MCP tools:
+
+- `play`
+- `pause`
+- `next`
+- `previous`
+- `ask`
+
+`ask` is the rich entrypoint. It reuses the same text-first behavior as A2A and CLI requests, so richer behavior such as adaptive sessions, playlist requests, and feedback requests should go through `ask`.
+
+Example MCP host config:
+
+```json
+{
+  "mcpServers": {
+    "cider-agent": {
+      "command": "cider-agent",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+When MCP is mounted over HTTP with `cider-agent serve --mcp`, the Streamable HTTP endpoint is:
+
+```text
+http://127.0.0.1:8766/mcp
+```
 
 ## How It Works
 

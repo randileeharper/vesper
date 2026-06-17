@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import uuid
+from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,7 @@ from a2a.server.routes import (
     create_rest_routes,
 )
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from starlette.routing import Route
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -40,6 +42,7 @@ from a2a.utils.errors import InternalError, InvalidParamsError
 from .action_registry import get_action_definition, is_public_action, match_text_action_definition
 from .app import get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
+from .mcp_server import create_mcp_server
 from .renderers import render_action_result_for_a2a, render_text_result_for_a2a
 
 
@@ -384,18 +387,31 @@ class CiderAgentExecutor(AgentExecutor):
         )
 
 
-@asynccontextmanager
-async def _lifespan(_: FastAPI):
-    service = get_service()
-    service.start_background_session_worker()
-    try:
-        yield
-    finally:
-        service.stop_background_session_worker()
+def _create_lifespan(mcp_session_manager=None):
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI):
+        service = get_service()
+        service.start_background_session_worker()
+        try:
+            async with AsyncExitStack() as stack:
+                if mcp_session_manager is not None:
+                    await stack.enter_async_context(mcp_session_manager.run())
+                yield
+        finally:
+            service.stop_background_session_worker()
+
+    return _lifespan
 
 
-def create_a2a_app() -> FastAPI:
-    app = FastAPI(title="Cider Agent", version="0.1.0", lifespan=_lifespan)
+def create_a2a_app(*, include_mcp: bool = False) -> FastAPI:
+    mcp_server = None
+    mcp_endpoint = None
+    if include_mcp:
+        mcp_server = create_mcp_server(streamable_http_path="/")
+        mcp_app = mcp_server.streamable_http_app()
+        mcp_endpoint = mcp_app.routes[0].endpoint
+
+    app = FastAPI(title="Cider Agent", version="0.1.0", lifespan=_create_lifespan(mcp_server.session_manager if mcp_server else None))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -416,18 +432,22 @@ def create_a2a_app() -> FastAPI:
         jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/a2a"),
         rest_routes=create_rest_routes(handler),
     )
+    if mcp_endpoint is not None:
+        app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint))
+        app.router.routes.append(Route("/mcp/", endpoint=mcp_endpoint))
     return app
 
 
-def run_server() -> None:
+def run_server(*, include_mcp: bool = False) -> None:
     settings = get_settings()
-    uvicorn.run(create_a2a_app(), host=settings.http_host, port=settings.http_port, reload=False)
+    uvicorn.run(create_a2a_app(include_mcp=include_mcp), host=settings.http_host, port=settings.http_port, reload=False)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the cider_agent A2A server.")
-    parser.parse_args()
-    run_server()
+    parser.add_argument("--mcp", action="store_true", help="Also mount the MCP Streamable HTTP transport at /mcp.")
+    args = parser.parse_args()
+    run_server(include_mcp=args.mcp)
 
 
 if __name__ == "__main__":
