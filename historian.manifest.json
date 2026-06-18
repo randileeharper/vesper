@@ -141,9 +141,20 @@
             "type": "object",
             "properties": {
               "mode": {"type": "string", "enum": ["preserve", "add", "replace"]},
-              "queries": {"type": "array", "items": {"type": "string"}}
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {"type": "string", "enum": ["artist", "genre", "vibe"]},
+                    "term": {"type": "string"}
+                  },
+                  "required": ["kind", "term"],
+                  "additionalProperties": false
+                }
+              }
             },
-            "required": ["mode", "queries"],
+            "required": ["mode", "sources"],
             "additionalProperties": false
           }
         },
@@ -156,7 +167,7 @@
       "version": 1,
       "record_family": "event",
       "description": "An adaptive session selected and played a track.",
-      "searchable_fields": ["caller", "request", "selection_strategy", "search_query", "track.id", "track.title", "track.artist"],
+      "searchable_fields": ["caller", "request", "selection_strategy", "search_kind", "search_query", "track.id", "track.title", "track.artist"],
       "redacted_fields": [],
       "json_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -165,6 +176,7 @@
           "caller": {"type": "string"},
           "request": {"type": "string"},
           "selection_strategy": {"type": "string"},
+          "search_kind": {"type": "string", "enum": ["artist", "genre", "vibe", "preference"]},
           "search_query": {"type": "string"},
           "track": {
             "type": "object",
@@ -180,7 +192,7 @@
             "additionalProperties": false
           }
         },
-        "required": ["caller", "request", "selection_strategy", "search_query", "track"],
+        "required": ["caller", "request", "selection_strategy", "search_kind", "search_query", "track"],
         "additionalProperties": false
       }
     },

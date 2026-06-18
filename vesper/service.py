@@ -26,7 +26,14 @@ from .historian import (
 from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
 from .results import EngineActionResult, TextRequestResult
-from .resolver import ResolvedAction, Resolver, SessionQueryPlan, SessionTrackSelection, build_resolver
+from .resolver import (
+    ResolvedAction,
+    Resolver,
+    SessionQueryPlan,
+    SessionSearchSource,
+    SessionTrackSelection,
+    build_resolver,
+)
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore
 
@@ -63,6 +70,11 @@ def _flatten_track_item(item: dict[str, Any]) -> dict[str, Any]:
 
 def _flatten_playlist_item(item: dict[str, Any]) -> dict[str, Any]:
     attributes = item.get("attributes", {}) if isinstance(item, dict) else {}
+    curator = attributes.get("curatorName")
+    if not curator and isinstance(item.get("relationships"), dict):
+        curator_data = item["relationships"].get("curator", {}).get("data", [])
+        if isinstance(curator_data, list) and curator_data:
+            curator = curator_data[0].get("attributes", {}).get("name")
     return {
         "id": item.get("id"),
         "type": item.get("type"),
@@ -73,6 +85,8 @@ def _flatten_playlist_item(item: dict[str, Any]) -> dict[str, Any]:
         else attributes.get("description"),
         "can_edit": attributes.get("canEdit"),
         "is_public": attributes.get("isPublic"),
+        "curator": curator,
+        "playlist_type": attributes.get("playlistType"),
         "raw": item,
     }
 
@@ -155,6 +169,8 @@ class CiderAgentService:
     PREFERENCE_SEED_SEARCH_LIMIT = 6
     PREFERENCE_SEED_ARTIST_CAP = 4
     PREFERENCE_SEED_POOL_QUERY = "__preference_seeded__"
+    PREFERENCE_SEED_SOURCE = SessionSearchSource(kind="preference", term=PREFERENCE_SEED_POOL_QUERY)
+    SESSION_STOREFRONT = "us"
 
     def __init__(
         self,
@@ -189,6 +205,7 @@ class CiderAgentService:
         self._debug_candidate_query_search_count = 0
         self._debug_candidate_query_search_ms = 0.0
         self._debug_selection_candidate_count = 0
+        self._genre_cache: dict[str, dict[str, str]] = {}
         self.reconcile_session_runtime()
 
     def close(self) -> None:
@@ -748,6 +765,88 @@ class CiderAgentService:
     def search_catalog_tracks(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
         return self.search_catalog(query, limit=limit, storefront=storefront, offset=offset)
 
+    def _catalog_resource_search(
+        self,
+        query: str,
+        *,
+        resource_type: str,
+        limit: int = 5,
+        storefront: str = SESSION_STOREFRONT,
+    ) -> list[dict[str, Any]]:
+        path = (
+            f"/v1/catalog/{storefront}/search?term={_encode_query(query)}"
+            f"&types={resource_type}&limit={limit}"
+        )
+        payload = self._rpc.run_amapi_v3(path)
+        items = payload.get("data", {}).get("results", {}).get(resource_type, {}).get("data", [])
+        return list(items) if isinstance(items, list) else []
+
+    def _catalog_relationship_tracks(
+        self,
+        path: str,
+        *,
+        storefront: str = SESSION_STOREFRONT,
+    ) -> list[dict[str, Any]]:
+        tracks: list[dict[str, Any]] = []
+        offset = 0
+        while len(tracks) < self.SESSION_SEARCH_RESULT_LIMIT:
+            limit = min(self.SESSION_SEARCH_PAGE_LIMIT, self.SESSION_SEARCH_RESULT_LIMIT - len(tracks))
+            separator = "&" if "?" in path else "?"
+            page_path = f"/v1/catalog/{storefront}{path}{separator}limit={limit}"
+            if offset:
+                page_path = f"{page_path}&offset={offset}"
+            payload = self._rpc.run_amapi_v3(page_path)
+            data = payload.get("data", {})
+            items = data.get("data", [])
+            if not items:
+                items = data.get("results", {}).get("songs", [{}])[0].get("data", [])
+            if not isinstance(items, list) or not items:
+                break
+            playable = [
+                _flatten_track_item(item)
+                for item in items
+                if isinstance(item, dict)
+                and item.get("type") == "songs"
+                and isinstance(item.get("attributes", {}).get("playParams"), dict)
+            ]
+            tracks.extend(playable)
+            if len(items) < limit:
+                break
+            offset += len(items)
+        return tracks[: self.SESSION_SEARCH_RESULT_LIMIT]
+
+    def _load_genre_map(self, storefront: str = SESSION_STOREFRONT) -> dict[str, str]:
+        if storefront in self._genre_cache:
+            return dict(self._genre_cache[storefront])
+        try:
+            payload = self._rpc.run_amapi_v3(f"/v1/catalog/{storefront}/genres")
+            items = payload.get("data", {}).get("data", [])
+            genre_map = {
+                str(item.get("attributes", {}).get("name", "")).strip(): str(item.get("id", "")).strip()
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("attributes", {}).get("name", "")).strip()
+                and str(item.get("attributes", {}).get("name", "")).strip() != "Music"
+                and str(item.get("id", "")).strip()
+            }
+            if len(genre_map) > 50:
+                genre_map = {}
+        except Exception as exc:
+            LOGGER.warning("Could not load Apple Music genres for %s: %s", storefront, exc)
+            genre_map = {}
+        self._genre_cache[storefront] = genre_map
+        return dict(genre_map)
+
+    def session_genre_names(self) -> list[str]:
+        return list(self._load_genre_map(self.SESSION_STOREFRONT))
+
+    def session_rejected_search_sources(self, session: dict[str, Any]) -> list[dict[str, str]]:
+        runtime = self._get_session_runtime(int(session.get("id", 0)))
+        return [
+            {"kind": source.kind, "term": source.term}
+            for source in self._normalize_search_sources(runtime.get("rejected_search_sources"))
+        ]
+
     def search(self, query: str, *, limit: int = 10, storefront: str = "us") -> dict[str, Any]:
         if self.default_search_source() == "library":
             result = self.search_library(query, limit=limit)
@@ -1105,7 +1204,7 @@ class CiderAgentService:
                 session_id=previous["id"],
             )
         self._clear_all_session_runtime()
-        self._set_session_runtime(session["id"], suspended=False, active_search_queries=[], query_pools={})
+        self._set_session_runtime(session["id"], suspended=False, active_search_sources=[], query_pools={})
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="starting")
         self._preferences.add_session_event(session["id"], event_type="session_started", metadata={"request": request.strip()})
         self._emit(
@@ -1158,15 +1257,16 @@ class CiderAgentService:
         session = self._preferences.add_session_steering(session["id"], request.strip())
         runtime = self._get_session_runtime(session["id"])
         resolved_search_update = self._normalize_session_search_update(search_update)
-        next_queries = self._next_session_search_queries(runtime, resolved_search_update)
-        current_queries = list(runtime.get("active_search_queries", []))
-        self._set_session_runtime(session["id"], suspended=False, active_search_queries=next_queries)
-        if resolved_search_update["mode"] == "replace" and next_queries != current_queries:
-            self._replace_session_query_pools(session, next_queries)
+        next_sources = self._next_session_search_sources(runtime, resolved_search_update)
+        current_sources = self._normalize_search_sources(runtime.get("active_search_sources"))
+        self._set_session_runtime(session["id"], suspended=False, active_search_sources=self._sources_payload(next_sources))
+        if resolved_search_update["mode"] == "replace" and next_sources != current_sources:
+            self._replace_session_query_pools(session, next_sources)
         elif resolved_search_update["mode"] == "add":
-            added_queries = [query for query in next_queries if query not in current_queries]
-            if added_queries:
-                self._ensure_session_query_pools(session, added_queries)
+            current_keys = {self._session_source_key(source) for source in current_sources}
+            added_sources = [source for source in next_sources if self._session_source_key(source) not in current_keys]
+            if added_sources:
+                self._ensure_session_query_pools(session, added_sources)
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
         self._preferences.add_session_event(
             session["id"],
@@ -1481,18 +1581,20 @@ class CiderAgentService:
                 plan = self._plan_session_query(session, count=1)
                 timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
                 collect_started_at = time.perf_counter()
-                tracks, search_query, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                tracks, search_source, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
                 if not tracks and getattr(plan, "resolver", "") != "preference-seeded":
+                    self._reject_session_plan_sources(session["id"], plan)
                     replan_started_at = time.perf_counter()
                     plan = self._plan_session_query(session, count=1, force_replan=True)
                     timings["replan_session_ms"] = _elapsed_ms(replan_started_at)
                     collect_retry_started_at = time.perf_counter()
-                    tracks, search_query, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                    tracks, search_source, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
                     timings["collect_retry_ms"] = _elapsed_ms(collect_retry_started_at)
                 timings["collect_tracks_ms"] = _elapsed_ms(collect_started_at)
                 if not tracks:
                     raise CiderValidationError("No playable candidate match could be resolved.")
                 lead_track = tracks[0]
+                public_search_kind = "vibe" if search_source.kind == "legacy" else search_source.kind
                 play_started_at = time.perf_counter()
                 playback_result = self._play_flattened_track(lead_track, is_library_default=False)
                 timings["play_track_ms"] = _elapsed_ms(play_started_at)
@@ -1505,7 +1607,8 @@ class CiderAgentService:
                         "caller": self._caller(),
                         "request": session["request_text"],
                         "selection_strategy": selection_strategy,
-                        "search_query": search_query,
+                        "search_query": search_source.term,
+                        "search_kind": public_search_kind,
                         "track": self._track_payload(lead_track),
                     },
                     source="app://vesper/session",
@@ -1539,10 +1642,11 @@ class CiderAgentService:
                     "enqueued_count": 0,
                     "tracks": [lead_track],
                     "plan": {
-                        "search_queries": plan.search_queries,
+                        "search_sources": self._sources_payload(plan.search_sources),
                     },
                     "selection": {
-                        "search_query": search_query,
+                        "search_query": search_source.term,
+                        "search_kind": public_search_kind,
                         "selected_index": selection.selected_index,
                     },
                 }
@@ -1556,24 +1660,43 @@ class CiderAgentService:
 
     def _plan_session_query(self, session: dict[str, Any], *, count: int, force_replan: bool = False) -> SessionQueryPlan:
         runtime = self._get_session_runtime(session["id"])
-        active_queries = self._normalize_search_queries(runtime.get("active_search_queries"))
-        if active_queries and not force_replan:
-            self._ensure_session_query_pools(session, active_queries)
-            return SessionQueryPlan(search_queries=active_queries[:count] or active_queries, resolver="session-runtime")
+        active_sources = self._normalize_search_sources(runtime.get("active_search_sources"))
+        if active_sources and not force_replan:
+            self._ensure_session_query_pools(session, active_sources)
+            return SessionQueryPlan(search_sources=active_sources[:count] or active_sources, resolver="session-runtime")
         if self._is_vague_play_request(session.get("request_text")):
-            seeded_queries = self._bootstrap_preference_seeded_session(session)
-            if seeded_queries:
-                self._set_session_runtime(session["id"], active_search_queries=seeded_queries)
-                return SessionQueryPlan(search_queries=seeded_queries[:count] or seeded_queries, resolver="preference-seeded")
+            seeded_sources = self._bootstrap_preference_seeded_session(session)
+            if seeded_sources:
+                self._set_session_runtime(session["id"], active_search_sources=self._sources_payload(seeded_sources))
+                return SessionQueryPlan(search_sources=seeded_sources[:count] or seeded_sources, resolver="preference-seeded")
         planner = getattr(self._resolver, "plan_session", None)
         if not callable(planner):
             raise CiderValidationError("The configured resolver does not support adaptive play sessions.")
         request = self._session_effective_request(session)
         plan = planner(request, self, session, count)
-        resolved_queries = self._normalize_search_queries(getattr(plan, "search_queries", []))
-        if resolved_queries:
-            self._set_session_runtime(session["id"], active_search_queries=resolved_queries, query_pools={})
-        return plan
+        resolved_sources = self._plan_search_sources(plan)
+        if force_replan:
+            rejected_keys = {
+                self._session_source_key(source)
+                for source in self._normalize_search_sources(runtime.get("rejected_search_sources"))
+            }
+            resolved_sources = [
+                source for source in resolved_sources if self._session_source_key(source) not in rejected_keys
+            ]
+        normalized_plan = SessionQueryPlan(
+            search_sources=resolved_sources,
+            resolver=getattr(plan, "resolver", "unknown"),
+            raw=getattr(plan, "raw", None),
+            reasoning=getattr(plan, "reasoning", None),
+            raw_content=getattr(plan, "raw_content", None),
+        )
+        if resolved_sources:
+            self._set_session_runtime(
+                session["id"],
+                active_search_sources=self._sources_payload(resolved_sources),
+                query_pools={},
+            )
+        return normalized_plan
 
     def _session_effective_request(self, session: dict[str, Any]) -> str:
         steering = session.get("steering_history", [])
@@ -1591,8 +1714,8 @@ class CiderAgentService:
         *,
         limit: int,
         timings: dict[str, Any] | None = None,
-    ) -> tuple[list[dict[str, Any]], str, SessionTrackSelection]:
-        chosen, search_query, selection = self._collect_session_tracks_from_pools(session, plan, limit=limit)
+    ) -> tuple[list[dict[str, Any]], SessionSearchSource, SessionTrackSelection]:
+        chosen, search_source, selection = self._collect_session_tracks_from_pools(session, plan, limit=limit)
 
         if timings is not None and self.include_timing_debug():
             timings["candidate_track_search_count"] = getattr(self, "_debug_candidate_track_search_count", 0)
@@ -1607,7 +1730,7 @@ class CiderAgentService:
                 self._normalize_session_query_pools(self._get_session_runtime(session["id"]).get("query_pools"))
             )
 
-        return chosen, search_query, selection
+        return chosen, search_source, selection
 
     def _collect_session_tracks_from_pools(
         self,
@@ -1615,7 +1738,7 @@ class CiderAgentService:
         plan: SessionQueryPlan,
         *,
         limit: int,
-    ) -> tuple[list[dict[str, Any]], str, SessionTrackSelection]:
+    ) -> tuple[list[dict[str, Any]], SessionSearchSource, SessionTrackSelection]:
         self._debug_candidate_track_search_count = 0
         self._debug_candidate_track_search_ms = 0.0
         self._debug_candidate_artist_search_count = 0
@@ -1625,42 +1748,89 @@ class CiderAgentService:
         self._debug_candidate_query_search_ms = 0.0
         empty_selection = SessionTrackSelection(selected_index=0, resolver="fallback")
 
-        search_queries = list(getattr(plan, "search_queries", None) or getattr(plan, "candidate_queries", []) or [])
-        last_query = ""
-        for query in search_queries:
-            query_text = str(query).strip()
-            if not query_text:
-                continue
-            last_query = query_text
+        search_sources = self._plan_search_sources(plan)
+        last_source = SessionSearchSource(kind="vibe", term="")
+        for source in search_sources:
+            last_source = source
+            source_key = self._session_source_key(source)
             while True:
-                window = self._next_session_candidate_window(session, query_text)
+                window = self._next_session_candidate_window(session, source)
                 if not window:
                     break
                 candidates = [entry["track"] for entry in window]
                 self._debug_selection_candidate_count = len(candidates)
-                selection = self._select_session_track(session, plan, query_text, candidates)
+                selection = self._select_session_track(session, plan, source.term, candidates)
                 if selection.selected_index < 0:
-                    self._mark_session_selection_window_screened_out(session["id"], query_text, window)
+                    self._mark_session_selection_window_screened_out(session["id"], source_key, window)
                     continue
                 chosen_index = min(selection.selected_index, len(candidates) - 1)
                 chosen_entry = window[chosen_index]
-                self._mark_session_track_played(session["id"], query_text, window, chosen_entry["index"])
-                return [chosen_entry["track"]][:limit], query_text, selection
+                self._mark_session_track_played(session["id"], source_key, window, chosen_entry["index"])
+                return [chosen_entry["track"]][:limit], source, selection
 
-        return [], last_query, empty_selection
+        return [], last_source, empty_selection
 
     def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(value, dict):
-            return {"mode": "preserve", "queries": []}
+            return {"mode": "preserve", "sources": []}
         mode = str(value.get("mode", "preserve")).strip().lower()
         if mode not in {"preserve", "add", "replace"}:
             mode = "preserve"
-        queries = self._normalize_search_queries(value.get("queries"))
-        if mode in {"add", "replace"} and not queries:
+        sources = self._normalize_search_sources(value.get("sources"))
+        if mode in {"add", "replace"} and not sources:
             mode = "preserve"
         if mode == "preserve":
-            queries = []
-        return {"mode": mode, "queries": queries}
+            sources = []
+        return {"mode": mode, "sources": self._sources_payload(sources)}
+
+    def _normalize_search_sources(self, value: Any) -> list[SessionSearchSource]:
+        if isinstance(value, SessionSearchSource):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        sources: list[SessionSearchSource] = []
+        seen: set[str] = set()
+        for item in value:
+            if isinstance(item, SessionSearchSource):
+                kind, term = item.kind, item.term
+            elif isinstance(item, dict):
+                kind, term = item.get("kind"), item.get("term")
+            else:
+                continue
+            kind = str(kind or "").strip().lower()
+            term = str(term or "").strip()
+            if kind not in {"artist", "genre", "vibe", "preference", "legacy"} or not term:
+                continue
+            source = SessionSearchSource(kind=kind, term=term)
+            key = self._session_source_key(source)
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(source)
+        return sources
+
+    def _plan_search_sources(self, plan: Any) -> list[SessionSearchSource]:
+        sources = self._normalize_search_sources(getattr(plan, "search_sources", []))
+        if sources:
+            return sources
+        # Transitional compatibility for third-party resolvers.
+        return [
+            SessionSearchSource(kind="legacy", term=query)
+            for query in self._normalize_search_queries(getattr(plan, "search_queries", []))
+        ]
+
+    def _sources_payload(self, sources: list[SessionSearchSource]) -> list[dict[str, str]]:
+        return [{"kind": source.kind, "term": source.term} for source in sources]
+
+    def _session_source_key(self, source: SessionSearchSource) -> str:
+        if isinstance(source, str):
+            source = SessionSearchSource(kind="legacy", term=source)
+        return json.dumps(
+            {"kind": source.kind, "term": source.term.casefold()},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _normalize_search_queries(self, value: Any) -> list[str]:
         if isinstance(value, str):
@@ -1680,23 +1850,36 @@ class CiderAgentService:
             queries.append(query)
         return queries
 
-    def _next_session_search_queries(self, runtime: dict[str, Any], search_update: dict[str, Any]) -> list[str]:
-        current_queries = self._normalize_search_queries(runtime.get("active_search_queries"))
+    def _next_session_search_sources(
+        self,
+        runtime: dict[str, Any],
+        search_update: dict[str, Any],
+    ) -> list[SessionSearchSource]:
+        current_sources = self._normalize_search_sources(runtime.get("active_search_sources"))
         mode = search_update.get("mode", "preserve")
-        new_queries = self._normalize_search_queries(search_update.get("queries"))
+        new_sources = self._normalize_search_sources(search_update.get("sources"))
         if mode == "replace":
-            return new_queries
+            return new_sources
         if mode == "add":
-            merged = list(current_queries)
-            seen = {query.casefold() for query in merged}
-            for query in new_queries:
-                lowered = query.casefold()
-                if lowered in seen:
+            merged = list(current_sources)
+            seen = {self._session_source_key(source) for source in merged}
+            for source in new_sources:
+                key = self._session_source_key(source)
+                if key in seen:
                     continue
-                seen.add(lowered)
-                merged.append(query)
+                seen.add(key)
+                merged.append(source)
             return merged
-        return current_queries
+        return current_sources
+
+    def _reject_session_plan_sources(self, session_id: int, plan: SessionQueryPlan) -> None:
+        runtime = self._get_session_runtime(session_id)
+        rejected = self._normalize_search_sources(runtime.get("rejected_search_sources"))
+        keys = {self._session_source_key(source) for source in rejected}
+        for source in self._plan_search_sources(plan):
+            if self._session_source_key(source) not in keys:
+                rejected.append(source)
+        self._set_session_runtime(session_id, rejected_search_sources=self._sources_payload(rejected))
 
     def _filter_session_search_candidates(
         self,
@@ -1731,10 +1914,18 @@ class CiderAgentService:
         if not isinstance(value, dict):
             return {}
         normalized: dict[str, dict[str, Any]] = {}
-        for raw_query, raw_pool in value.items():
-            query = str(raw_query).strip()
-            if not query or not isinstance(raw_pool, dict):
+        for raw_key, raw_pool in value.items():
+            key = str(raw_key).strip()
+            if not key or not isinstance(raw_pool, dict):
                 continue
+            source_values = raw_pool.get("source")
+            sources = self._normalize_search_sources([source_values] if isinstance(source_values, dict) else [])
+            if not sources:
+                legacy_query = str(raw_pool.get("search_query") or key).strip()
+                sources = [SessionSearchSource(kind="vibe", term=legacy_query)] if legacy_query else []
+            if not sources:
+                continue
+            source = sources[0]
             raw_entries = raw_pool.get("entries", [])
             entries: list[dict[str, Any]] = []
             if isinstance(raw_entries, list):
@@ -1748,11 +1939,15 @@ class CiderAgentService:
             cursor = raw_pool.get("cursor", 0)
             if not isinstance(cursor, int):
                 cursor = 0
-            normalized[query] = {
-                "search_query": query,
+            normalized[key] = {
+                "source": {"kind": source.kind, "term": source.term},
+                "search_query": source.term,
                 "cursor": cursor % len(entries) if entries else 0,
                 "entries": entries,
             }
+            for metadata_key in ("resolved_artist_id", "resolved_genre_id", "resolved_playlist_id", "resolved_name"):
+                if raw_pool.get(metadata_key) is not None:
+                    normalized[key][metadata_key] = raw_pool[metadata_key]
         return normalized
 
     def _session_query_pool_build_excluded_ids(self) -> set[str]:
@@ -1763,8 +1958,10 @@ class CiderAgentService:
                 excluded.add(track_id)
         return excluded
 
-    def _build_session_query_pool(self, session: dict[str, Any], search_query: str) -> dict[str, Any]:
-        raw_tracks = self._fetch_session_search_results(search_query)
+    def _build_session_query_pool(self, session: dict[str, Any], source: SessionSearchSource) -> dict[str, Any]:
+        if isinstance(source, str):
+            source = SessionSearchSource(kind="legacy", term=source)
+        raw_tracks, metadata = self._fetch_session_source_results(session, source)
         global_rejected_ids = self._preferences.globally_rejected_track_ids()
         recent_track_ids = {
             _clean_id(track.get("track_id"))
@@ -1780,7 +1977,8 @@ class CiderAgentService:
             stage="session_query_pool_built",
             payload={
                 "session_id": session.get("id"),
-                "search_query": search_query,
+                "search_source": {"kind": source.kind, "term": source.term},
+                "resolved_resource": metadata,
                 "cursor": 0,
                 "raw_track_count": len(raw_tracks),
                 "pool_track_count": len(cached_tracks),
@@ -1796,12 +1994,14 @@ class CiderAgentService:
             },
         )
         return {
-            "search_query": search_query,
+            "source": {"kind": source.kind, "term": source.term},
+            "search_query": source.term,
             "cursor": 0,
             "entries": [{"track": track, "state": "fresh"} for track in cached_tracks],
+            **metadata,
         }
 
-    def _bootstrap_preference_seeded_session(self, session: dict[str, Any]) -> list[str]:
+    def _bootstrap_preference_seeded_session(self, session: dict[str, Any]) -> list[SessionSearchSource]:
         cues = self._preference_seed_cues()
         artists = self._preferences.favored_artists()
         liked_tracks = self._preferences.liked_tracks()
@@ -1877,15 +2077,19 @@ class CiderAgentService:
         self._set_session_runtime(
             session["id"],
             query_pools={
-                self.PREFERENCE_SEED_POOL_QUERY: {
+                self._session_source_key(self.PREFERENCE_SEED_SOURCE): {
+                    "source": {
+                        "kind": self.PREFERENCE_SEED_SOURCE.kind,
+                        "term": self.PREFERENCE_SEED_SOURCE.term,
+                    },
                     "search_query": self.PREFERENCE_SEED_POOL_QUERY,
                     "cursor": 0,
                     "entries": [{"track": track, "state": "fresh"} for track in merged_tracks],
                 }
             },
-            active_search_queries=[self.PREFERENCE_SEED_POOL_QUERY],
+            active_search_sources=self._sources_payload([self.PREFERENCE_SEED_SOURCE]),
         )
-        return [self.PREFERENCE_SEED_POOL_QUERY]
+        return [self.PREFERENCE_SEED_SOURCE]
 
     def _preference_seed_cues(self) -> list[dict[str, Any]]:
         cues: list[dict[str, Any]] = []
@@ -2029,38 +2233,140 @@ class CiderAgentService:
                 return value
         return None
 
-    def _fetch_session_search_results(self, search_query: str) -> list[dict[str, Any]]:
-        tracks: list[dict[str, Any]] = []
-        offset = 0
-        while len(tracks) < self.SESSION_SEARCH_RESULT_LIMIT:
-            page_limit = min(self.SESSION_SEARCH_PAGE_LIMIT, self.SESSION_SEARCH_RESULT_LIMIT - len(tracks))
-            search_started_at = time.perf_counter()
-            results = self.search_catalog_tracks(search_query, limit=page_limit, offset=offset)
+    def _fetch_session_source_results(
+        self,
+        session: dict[str, Any],
+        source: SessionSearchSource,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        search_started_at = time.perf_counter()
+        self._debug_candidate_query_search_count += 1
+        try:
+            if source.kind == "artist":
+                artists = self._catalog_resource_search(source.term, resource_type="artists", limit=5)
+                if not artists:
+                    return [], {}
+                normalized_term = _normalize_match_text(source.term)
+                artist = next(
+                    (
+                        item
+                        for item in artists
+                        if _normalize_match_text(item.get("attributes", {}).get("name")) == normalized_term
+                    ),
+                    artists[0],
+                )
+                artist_id = _clean_id(artist.get("id"))
+                if not artist_id:
+                    return [], {}
+                tracks = self._catalog_relationship_tracks(f"/artists/{artist_id}/view/top-songs")
+                return tracks, {
+                    "resolved_artist_id": artist_id,
+                    "resolved_name": artist.get("attributes", {}).get("name"),
+                }
+            if source.kind == "genre":
+                genre_map = self._load_genre_map(self.SESSION_STOREFRONT)
+                genre_id = genre_map.get(source.term)
+                if not genre_id:
+                    return [], {}
+                tracks = self._catalog_relationship_tracks(f"/charts?types=songs&genre={_encode_query(genre_id)}")
+                return tracks, {"resolved_genre_id": genre_id, "resolved_name": source.term}
+            if source.kind == "vibe":
+                playlists = self._catalog_resource_search(source.term, resource_type="playlists", limit=5)
+                candidates = [self._playlist_selection_candidate(item) for item in playlists]
+                self.append_session_debug_log(
+                    stage="session_playlist_candidates",
+                    payload={
+                        "session_id": session.get("id"),
+                        "search_source": {"kind": source.kind, "term": source.term},
+                        "candidates": candidates,
+                    },
+                )
+                if not candidates:
+                    return [], {}
+                chooser = getattr(self._resolver, "select_session_playlist", None)
+                selection = (
+                    chooser(self._session_effective_request(session), self, session, source, candidates)
+                    if callable(chooser)
+                    else SessionTrackSelection(selected_index=0, resolver="fallback")
+                )
+                if selection.selected_index < 0:
+                    return [], {}
+                selected_index = min(selection.selected_index, len(playlists) - 1)
+                playlist = playlists[selected_index]
+                playlist_id = _clean_id(playlist.get("id"))
+                if not playlist_id:
+                    return [], {}
+                tracks = self._catalog_relationship_tracks(f"/playlists/{playlist_id}/tracks")
+                metadata = {
+                    "resolved_playlist_id": playlist_id,
+                    "resolved_name": playlist.get("attributes", {}).get("name"),
+                }
+                self.append_session_debug_log(
+                    stage="session_playlist_selected",
+                    payload={
+                        "session_id": session.get("id"),
+                        "search_source": {"kind": source.kind, "term": source.term},
+                        "selected_index": selected_index,
+                        "playlist": candidates[selected_index],
+                    },
+                )
+                return tracks, metadata
+            if source.kind == "preference":
+                return [], {}
+            if source.kind == "legacy":
+                tracks: list[dict[str, Any]] = []
+                offset = 0
+                while len(tracks) < self.SESSION_SEARCH_RESULT_LIMIT:
+                    limit = min(self.SESSION_SEARCH_PAGE_LIMIT, self.SESSION_SEARCH_RESULT_LIMIT - len(tracks))
+                    results = self.search_catalog_tracks(source.term, limit=limit, offset=offset)
+                    page_tracks = list(results.get("tracks", []))
+                    if not page_tracks:
+                        break
+                    tracks.extend(page_tracks)
+                    if len(page_tracks) < limit:
+                        break
+                    offset += len(page_tracks)
+                return tracks[: self.SESSION_SEARCH_RESULT_LIMIT], {"resolved_name": source.term}
+            return [], {}
+        finally:
             self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
-            self._debug_candidate_query_search_count += 1
-            page_tracks = list(results.get("tracks", []))
-            if not page_tracks:
-                break
-            tracks.extend(page_tracks)
-            if len(page_tracks) < page_limit:
-                break
-            offset += len(page_tracks)
-        return tracks[: self.SESSION_SEARCH_RESULT_LIMIT]
 
-    def _replace_session_query_pools(self, session: dict[str, Any], search_queries: list[str]) -> None:
+    def _playlist_selection_candidate(self, item: dict[str, Any]) -> dict[str, Any]:
+        playlist = _flatten_playlist_item(item)
+        description = str(playlist.get("description") or "").strip()
+        return {
+            "name": playlist.get("name"),
+            "curator": playlist.get("curator"),
+            "playlist_type": playlist.get("playlist_type") or playlist.get("type"),
+            "description": description[:280],
+        }
+
+    def _replace_session_query_pools(
+        self,
+        session: dict[str, Any],
+        search_sources: list[SessionSearchSource],
+    ) -> None:
         pools: dict[str, dict[str, Any]] = {}
-        for query in self._normalize_search_queries(search_queries):
-            pools[query] = self._build_session_query_pool(session, query)
-        self._set_session_runtime(session["id"], query_pools=pools, active_search_queries=list(pools))
+        for source in self._normalize_search_sources(search_sources):
+            pools[self._session_source_key(source)] = self._build_session_query_pool(session, source)
+        self._set_session_runtime(
+            session["id"],
+            query_pools=pools,
+            active_search_sources=self._sources_payload(self._normalize_search_sources(search_sources)),
+        )
 
-    def _ensure_session_query_pools(self, session: dict[str, Any], search_queries: list[str]) -> None:
+    def _ensure_session_query_pools(
+        self,
+        session: dict[str, Any],
+        search_sources: list[SessionSearchSource],
+    ) -> None:
         runtime = self._get_session_runtime(session["id"])
         pools = self._normalize_session_query_pools(runtime.get("query_pools"))
         updated = False
-        for query in self._normalize_search_queries(search_queries):
-            if query in pools:
+        for source in self._normalize_search_sources(search_sources):
+            key = self._session_source_key(source)
+            if key in pools:
                 continue
-            pools[query] = self._build_session_query_pool(session, query)
+            pools[key] = self._build_session_query_pool(session, source)
             updated = True
         if updated:
             self._set_session_runtime(session["id"], query_pools=pools)
@@ -2068,8 +2374,10 @@ class CiderAgentService:
                 stage="session_query_pools_initialized",
                 payload={
                     "session_id": session.get("id"),
-                    "active_search_queries": self._normalize_search_queries(runtime.get("active_search_queries")),
-                    "pool_queries": list(pools),
+                    "active_search_sources": self._sources_payload(
+                        self._normalize_search_sources(runtime.get("active_search_sources"))
+                    ),
+                    "pool_sources": [pool.get("source") for pool in pools.values()],
                     "pool_count": len(pools),
                 },
             )
@@ -2079,16 +2387,28 @@ class CiderAgentService:
         current = playback.get("track", {})
         return _clean_id(current.get("track_id"))
 
-    def _next_session_candidate_window(self, session: dict[str, Any], search_query: str) -> list[dict[str, Any]]:
+    def _next_session_candidate_window(
+        self,
+        session: dict[str, Any],
+        source: SessionSearchSource,
+    ) -> list[dict[str, Any]]:
         # Session selection is intentionally cursor-based and sequential:
         # build one ordered pool per search query, offer the next window of
         # fresh tracks starting at the pool cursor, and rely on entry state
         # (`played`, `screened_out`, `rejected`) to prevent replaying the same
         # candidates until the pool has been exhausted and explicitly reset.
-        self._ensure_session_query_pools(session, [search_query])
+        if isinstance(source, str):
+            source = SessionSearchSource(kind="legacy", term=source)
         runtime = self._get_session_runtime(session["id"])
         pools = self._normalize_session_query_pools(runtime.get("query_pools"))
-        pool = pools.get(search_query)
+        source_key = self._session_source_key(source)
+        if source_key not in pools and source.term in pools:
+            source_key = source.term
+        else:
+            self._ensure_session_query_pools(session, [source])
+            runtime = self._get_session_runtime(session["id"])
+            pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+        pool = pools.get(source_key)
         if not pool:
             return []
         current_track_id = self._current_session_track_id(session)
@@ -2098,7 +2418,7 @@ class CiderAgentService:
                 stage="session_candidate_window",
                 payload={
                     "session_id": session.get("id"),
-                    "search_query": search_query,
+                    "search_source": {"kind": source.kind, "term": source.term},
                     "cursor": pool.get("cursor", 0),
                     "pool_track_count": len(pool.get("entries", [])),
                     "window_track_count": len(window),
@@ -2120,11 +2440,11 @@ class CiderAgentService:
             # reconsidered before played tracks. Rejected tracks are never reset
             # here; they stay unavailable until the pool is rebuilt.
             if self._reset_session_query_pool_state(pool, from_state="screened_out"):
-                pools[search_query] = pool
+                pools[source_key] = pool
                 self._set_session_runtime(session["id"], query_pools=pools)
                 continue
             if self._reset_session_query_pool_state(pool, from_state="played"):
-                pools[search_query] = pool
+                pools[source_key] = pool
                 self._set_session_runtime(session["id"], query_pools=pools)
                 continue
             return []
@@ -2193,10 +2513,11 @@ class CiderAgentService:
         if selected_entry_index is not None and 0 <= selected_entry_index < len(entries):
             entries[selected_entry_index]["state"] = "played"
             selected_track = entries[selected_entry_index]["track"]
+            source_term = str(pool.get("source", {}).get("term") or pool.get("search_query") or search_query)
             self._set_session_runtime(
                 session_id,
                 current_pool_query=search_query,
-                current_seed_query=str(selected_track.get("_seed_query", "")).strip() or search_query,
+                current_seed_query=str(selected_track.get("_seed_query", "")).strip() or source_term,
                 current_track_id=_clean_id(selected_track.get("id")) or _clean_id(selected_track.get("play_params", {}).get("id")),
             )
         last_index = window[-1]["index"]
@@ -2416,15 +2737,24 @@ class CiderAgentService:
             interesting = {
                 key: value
                 for key, value in updates.items()
-                if key in {"active_search_queries", "query_pools", "current_pool_query", "current_track_id", "suspended"}
+                if key
+                in {
+                    "active_search_sources",
+                    "rejected_search_sources",
+                    "query_pools",
+                    "current_pool_query",
+                    "current_track_id",
+                    "suspended",
+                }
             }
             if "query_pools" in interesting and isinstance(interesting["query_pools"], dict):
                 interesting["query_pools"] = {
-                    str(query): {
+                    str(source_key): {
+                        "source": pool.get("source"),
                         "cursor": pool.get("cursor", 0),
                         "entry_count": len(pool.get("entries", [])) if isinstance(pool, dict) else 0,
                     }
-                    for query, pool in interesting["query_pools"].items()
+                    for source_key, pool in interesting["query_pools"].items()
                     if isinstance(pool, dict)
                 }
             if interesting:

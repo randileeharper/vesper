@@ -495,10 +495,13 @@ def test_openai_compatible_resolver_normalizes_structured_session_search_update(
                                     "action": "steer_session",
                                     "parameters": {
                                         "request": "add some radwimps",
-                                        "search_update": {
-                                            "mode": "add",
-                                            "queries": [" some radwimps ", "some radwimps"],
-                                        },
+                                            "search_update": {
+                                                "mode": "add",
+                                                "sources": [
+                                                    {"kind": "artist", "term": " RADWIMPS "},
+                                                    {"kind": "artist", "term": "RADWIMPS"},
+                                                ],
+                                            },
                                     },
                                 }
                             )
@@ -513,7 +516,10 @@ def test_openai_compatible_resolver_normalizes_structured_session_search_update(
 
     resolved = resolver.resolve("add some radwimps", service)
 
-    assert resolved.parameters["search_update"] == {"mode": "add", "queries": ["radwimps"]}
+    assert resolved.parameters["search_update"] == {
+        "mode": "add",
+        "sources": [{"kind": "artist", "term": "RADWIMPS"}],
+    }
 
 
 def test_openai_compatible_resolver_includes_reasoning_when_enabled(settings: Settings, service) -> None:
@@ -836,7 +842,7 @@ def test_openai_compatible_resolver_can_steer_session_without_interrupting(setti
     assert resolved.action == "steer_session"
     assert resolved.parameters == {
         "request": "more like Favorite Artist - Liked Song",
-        "search_update": {"mode": "preserve", "queries": []},
+        "search_update": {"mode": "preserve", "sources": []},
     }
 
 

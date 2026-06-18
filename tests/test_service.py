@@ -5,7 +5,7 @@ import pytest
 from vesper.action_registry import get_action_definition
 from vesper.config import Settings
 from vesper.errors import CiderValidationError, TextRequestExecutionError
-from vesper.resolver import ResolvedAction
+from vesper.resolver import ResolvedAction, SessionSearchSource
 from vesper.service import CiderAgentService
 from vesper.storage import PreferenceStore
 
@@ -551,9 +551,11 @@ def test_vague_session_bootstraps_from_saved_preferences(service) -> None:
 
     result = service.play_session("play some music")
 
-    assert result["result"]["plan"]["search_queries"] == ["__preference_seeded__"]
+    assert result["result"]["plan"]["search_sources"] == [
+        {"kind": "preference", "term": "__preference_seeded__"}
+    ]
     runtime = service._get_session_runtime(result["session"]["id"])
-    pool = runtime["query_pools"]["__preference_seeded__"]
+    pool = next(iter(runtime["query_pools"].values()))
     assert pool["entries"]
     assert any(entry["track"].get("_seed_query") == "Favorite Artist Liked Song" for entry in pool["entries"])
 
@@ -902,7 +904,7 @@ def test_session_search_cache_reuses_large_result_pool_without_requerying(servic
         ["Wide Song 7", "Wide Song 8"],
     ]
     runtime = service._get_session_runtime(session["id"])
-    pool = runtime["query_pools"]["Favorite Artist Wide Pool"]
+    pool = next(iter(runtime["query_pools"].values()))
     assert [entry["state"] for entry in pool["entries"][:6]] == ["screened_out"] * 6
     assert pool["cursor"] == 0
 
@@ -1078,7 +1080,7 @@ def test_reject_current_track_marks_cached_entry_rejected_across_passes(service)
     service.reject_current_track()
 
     runtime = service._get_session_runtime(session["id"])
-    pool = runtime["query_pools"]["Favorite Artist Wide Pool"]
+    pool = next(iter(runtime["query_pools"].values()))
     rejected_entry = next(entry for entry in pool["entries"] if entry["track"]["id"] == rejected_track_id)
 
     assert rejected_entry["state"] == "rejected"
@@ -1281,13 +1283,13 @@ def test_preserve_steering_keeps_session_query_pools(service) -> None:
     started = service.play_session("play upbeat music")
     session = started["session"]
     runtime = service._get_session_runtime(session["id"])
-    assert "Favorite Artist Wide Pool" in runtime["query_pools"]
-    original_pool = runtime["query_pools"]["Favorite Artist Wide Pool"]
+    original_key = next(iter(runtime["query_pools"]))
+    original_pool = runtime["query_pools"][original_key]
 
     service.steer_session("prefer female vocalists")
 
     runtime = service._get_session_runtime(session["id"])
-    assert runtime["query_pools"]["Favorite Artist Wide Pool"] == original_pool
+    assert runtime["query_pools"][original_key] == original_pool
 
 
 def test_replace_steering_rebuilds_session_query_pools(service) -> None:
@@ -1315,13 +1317,16 @@ def test_replace_steering_rebuilds_session_query_pools(service) -> None:
     started = service.play_session("play upbeat music")
     session = started["session"]
     runtime = service._get_session_runtime(session["id"])
-    assert "Favorite Artist Wide Pool" in runtime["query_pools"]
+    assert next(iter(runtime["query_pools"].values()))["search_query"] == "Favorite Artist Wide Pool"
 
-    service.steer_session("switch to dream pop", search_update={"mode": "replace", "queries": ["dream pop"]})
+    service.steer_session(
+        "switch to dream pop",
+        search_update={"mode": "replace", "sources": [{"kind": "vibe", "term": "dream pop"}]},
+    )
 
     runtime = service._get_session_runtime(session["id"])
-    assert runtime["active_search_queries"] == ["dream pop"]
-    assert list(runtime["query_pools"]) == ["dream pop"]
+    assert runtime["active_search_sources"] == [{"kind": "vibe", "term": "dream pop"}]
+    assert next(iter(runtime["query_pools"].values()))["source"] == {"kind": "vibe", "term": "dream pop"}
 
 
 def test_additive_steering_appends_session_search_query(service) -> None:
@@ -1349,11 +1354,20 @@ def test_additive_steering_appends_session_search_query(service) -> None:
     started = service.play_session("play trip hop")
     session = started["session"]
 
-    service.steer_session("add some radwimps", search_update={"mode": "add", "queries": ["RADWIMPS"]})
+    service.steer_session(
+        "add some radwimps",
+        search_update={"mode": "add", "sources": [{"kind": "artist", "term": "RADWIMPS"}]},
+    )
 
     runtime = service._get_session_runtime(session["id"])
-    assert runtime["active_search_queries"] == ["trip hop", "RADWIMPS"]
-    assert list(runtime["query_pools"]) == ["trip hop", "RADWIMPS"]
+    assert runtime["active_search_sources"] == [
+        {"kind": "legacy", "term": "trip hop"},
+        {"kind": "artist", "term": "RADWIMPS"},
+    ]
+    assert [pool["source"] for pool in runtime["query_pools"].values()] == [
+        {"kind": "legacy", "term": "trip hop"},
+        {"kind": "artist", "term": "RADWIMPS"},
+    ]
 
 
 def test_top_pool_order_randomizes_within_small_high_confidence_bucket(service) -> None:

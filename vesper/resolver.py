@@ -27,10 +27,18 @@ class ResolvedAction:
 
 
 @dataclass
-class SessionQueryPlan:
-    """Search queries for the next step of an adaptive play session."""
+class SessionSearchSource:
+    """Typed catalog source for an adaptive play session."""
 
-    search_queries: list[str]
+    kind: str
+    term: str
+
+
+@dataclass
+class SessionQueryPlan:
+    """Search sources for the next step of an adaptive play session."""
+
+    search_sources: list[SessionSearchSource]
     resolver: str
     raw: dict[str, Any] | None = None
     reasoning: str | None = None
@@ -38,7 +46,12 @@ class SessionQueryPlan:
 
     @property
     def candidate_queries(self) -> list[str]:
-        return self.search_queries
+        return [source.term for source in self.search_sources]
+
+    @property
+    def search_queries(self) -> list[str]:
+        """Compatibility view for older callers and debug consumers."""
+        return self.candidate_queries
 
     @property
     def candidate_tracks(self) -> list[dict[str, str]]:
@@ -79,6 +92,16 @@ class Resolver(Protocol):
     ) -> SessionTrackSelection:
         """Choose one track from real catalog candidates."""
 
+    def select_session_playlist(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        """Choose one playlist from real catalog candidates."""
+
 
 class FallbackResolver:
     """Minimal deterministic fallback for obvious direct commands."""
@@ -105,7 +128,7 @@ class FallbackResolver:
     def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionQueryPlan:
         query = request.strip()
         return SessionQueryPlan(
-            search_queries=[query] if query else [],
+            search_sources=[SessionSearchSource(kind="vibe", term=query)] if query else [],
             resolver="fallback",
         )
 
@@ -115,6 +138,16 @@ class FallbackResolver:
         service: Any,
         session: dict[str, Any],
         search_query: str,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        return SessionTrackSelection(selected_index=0, resolver="fallback")
+
+    def select_session_playlist(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
         candidates: list[dict[str, Any]],
     ) -> SessionTrackSelection:
         return SessionTrackSelection(selected_index=0, resolver="fallback")
@@ -214,16 +247,19 @@ class OpenAICompatibleResolver:
         logger = getattr(service, "append_resolver_debug_log", None)
         if callable(logger):
             logger(stage="plan_session_query", messages=messages, response_body=body, response_content=content)
-        search_queries = self._normalize_candidate_queries(parsed.get("search_queries"))
-        if not search_queries:
-            search_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))
-        if not search_queries:
+        search_sources = self._normalize_search_sources(parsed.get("search_sources"))
+        if not search_sources:
+            search_sources = [
+                SessionSearchSource(kind="vibe", term=query)
+                for query in self._normalize_candidate_queries(parsed.get("search_queries"))
+            ]
+        if not search_sources:
             synthesized = self._fallback_query_from_text(request)
             if synthesized:
-                search_queries = [synthesized]
-        search_queries = search_queries[: self.MAX_SESSION_SEARCH_QUERIES]
+                search_sources = [SessionSearchSource(kind="vibe", term=synthesized)]
+        search_sources = search_sources[: self.MAX_SESSION_SEARCH_QUERIES]
         return SessionQueryPlan(
-            search_queries=search_queries,
+            search_sources=search_sources,
             resolver="openai_compatible",
             raw=parsed,
             reasoning=self._extract_reasoning(body),
@@ -253,6 +289,35 @@ class OpenAICompatibleResolver:
             selected_index = -1
         if selected_index >= len(candidates):
             selected_index = 0
+        return SessionTrackSelection(
+            selected_index=selected_index,
+            resolver="openai_compatible",
+            raw=parsed,
+            reasoning=self._extract_reasoning(body),
+            raw_content=self._extract_raw_content(content),
+        )
+
+    def select_session_playlist(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        candidates: list[dict[str, Any]],
+    ) -> SessionTrackSelection:
+        headers = {"Content-Type": "application/json"}
+        if self._settings.resolver_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
+        messages = self._build_playlist_selection_messages(request, service, session, search_source, candidates)
+        body, content, parsed = self._complete_parsed_json(messages, headers)
+        logger = getattr(service, "append_resolver_debug_log", None)
+        if callable(logger):
+            logger(stage="select_session_playlist", messages=messages, response_body=body, response_content=content)
+        selected_index = parsed.get("selected_index")
+        if not isinstance(selected_index, int) or selected_index >= len(candidates):
+            selected_index = 0
+        if selected_index < -1:
+            selected_index = -1
         return SessionTrackSelection(
             selected_index=selected_index,
             resolver="openai_compatible",
@@ -292,6 +357,7 @@ class OpenAICompatibleResolver:
             "When the user asks for vague playback like 'play some music', still use play_session. "
             "Use play_search_result or play_candidate_match only for specific song requests. "
             "For play_session and steer_session, always use parameters.request. "
+            "For steer_session search_update, use {mode, sources}; each source has kind artist, genre, or vibe and term. "
             "Keep request text short and concrete. "
             "Do not invent songs, artists, or albums."
         )
@@ -307,12 +373,20 @@ class OpenAICompatibleResolver:
             "session_steering": session.get("steering_history", [])[-5:],
             "playback_summary": self._compact_session_playback_summary(service.session_planning_playback_snapshot(session)),
             "preferences": service.list_preferences()["preferences"][:5],
+            "supported_genres": service.session_genre_names(),
+            "rejected_sources": service.session_rejected_search_sources(session),
             "count": count,
         }
         system = (
-            "You are planning the next search request for an adaptive music session in Vesper. "
-            "Return only JSON with key search_queries, containing a short list of search strings. "
-            f"The session needs {count} search query right now; return exactly 1 query when possible. "
+            "You are planning the next typed source for an adaptive music session in Vesper. "
+            "Return only JSON with key search_sources, containing objects with kind and term. "
+            f"The session needs {count} source right now; return exactly 1 source when possible. "
+            "Allowed kinds are artist, genre, and vibe. "
+            "Use artist for artist names, including artist-plus-mood requests; put only the artist name in term. "
+            "Use genre only when term exactly matches one of supported_genres. "
+            "Use vibe for genre-plus-mood/activity, unsupported subgenres, and descriptive requests. "
+            "If supported_genres is empty, never use genre. "
+            "Never repeat a source listed in rejected_sources; choose a materially different source. "
             "Honor the original session_request, steering changes, and the current timestamp. "
             "Treat session_steering as persistent cumulative session state, not a one-turn hint. "
             "Negative steering must continue to apply to future selections until explicitly overridden. "
@@ -322,12 +396,56 @@ class OpenAICompatibleResolver:
             "If the user already asked for a specific genre, artist, era, or other concrete music descriptor, preserve that request broadly instead of narrowing it to a more specific sub-vibe, mood, or subset unless the user explicitly asked for that narrowing. "
             "For example, a request like 'play trip-hop' should stay broad and should not be rewritten into a narrower variant like 'atmospheric trip hop' unless the user asked for atmospheric music. "
             "Use more creative interpretation only when the request is open-ended, contextual, or activity-based, such as cleaning, studying, waking up, winding down, or hosting people. "
-            "Do not guess final tracks from memory here; focus on the best Apple Music search string."
+            "Do not guess final tracks from memory here; choose the best typed Apple Music retrieval source."
         )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nPlan the next search query for this session."},
         ]
+
+    def _build_playlist_selection_messages(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        context = {
+            "current_timestamp": service.current_timestamp(),
+            "session_request": session.get("request_text"),
+            "session_steering": session.get("steering_history", [])[-5:],
+            "search_source": {"kind": search_source.kind, "term": search_source.term},
+            "candidates": candidates[:5],
+        }
+        system = (
+            "Choose the Apple Music playlist that best matches this adaptive session vibe. "
+            "Return only JSON with shape {\"selected_index\": number}. "
+            "Use -1 when none of the playlists fit."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nChoose a playlist."},
+        ]
+
+    def _normalize_search_sources(self, value: Any) -> list[SessionSearchSource]:
+        if not isinstance(value, list):
+            return []
+        sources: list[SessionSearchSource] = []
+        seen: set[tuple[str, str]] = set()
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "")).strip().lower()
+            term = str(item.get("term", "")).strip()
+            if kind not in {"artist", "genre", "vibe"} or not term:
+                continue
+            key = (kind, term.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(SessionSearchSource(kind=kind, term=term))
+        return sources
 
     def _build_session_selection_messages(
         self,
@@ -676,25 +794,19 @@ class OpenAICompatibleResolver:
 
     def _normalize_search_update(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
-            return {"mode": "preserve", "queries": []}
+            return {"mode": "preserve", "sources": []}
         mode = str(value.get("mode", "preserve")).strip().lower()
         if mode not in {"preserve", "add", "replace"}:
             mode = "preserve"
-        queries = self._normalize_candidate_queries(value.get("queries"))
-        deduped_queries: list[str] = []
-        seen: set[str] = set()
-        for query in queries:
-            lowered = query.casefold()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            deduped_queries.append(query)
-        queries = deduped_queries
-        if mode in {"add", "replace"} and not queries:
+        sources = self._normalize_search_sources(value.get("sources"))
+        if mode in {"add", "replace"} and not sources:
             mode = "preserve"
         if mode == "preserve":
-            queries = []
-        return {"mode": mode, "queries": queries}
+            sources = []
+        return {
+            "mode": mode,
+            "sources": [{"kind": source.kind, "term": source.term} for source in sources],
+        }
 
 
 def build_resolver(settings: Settings) -> Resolver:
