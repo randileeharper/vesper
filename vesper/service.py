@@ -717,24 +717,29 @@ class CiderAgentService:
         return {"status": "ok", "result": self._rpc.playback_post("/play-url", {"url": url})}
 
     @_historian_operation
-    def play_item(self, item_id: str, *, kind: str = "songs", is_library: bool = False) -> dict[str, Any]:
+    def play_item(
+        self,
+        item_id: str,
+        *,
+        kind: str = "songs",
+        is_library: bool = False,
+        track: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not item_id.strip():
             raise CiderValidationError("item_id cannot be empty.")
         body = {"id": item_id, "type": kind, "isLibrary": is_library}
         result = {"status": "ok", "result": self._rpc.playback_post("/play-item", body)}
+        track_payload = self._track_payload(track) or {}
+        track_payload.update({"id": item_id, "kind": kind, "is_library": is_library})
+        track_payload.setdefault("title", None)
+        track_payload.setdefault("artist", None)
+        track_payload.setdefault("album", None)
         self._emit(
             "music.playback.started",
             {
                 "caller": self._caller(),
                 "action": "play_item",
-                "track": {
-                    "id": item_id,
-                    "title": None,
-                    "artist": None,
-                    "album": None,
-                    "kind": kind,
-                    "is_library": is_library,
-                },
+                "track": track_payload,
             },
             source="app://vesper/playback",
             subject=item_id,
@@ -1006,13 +1011,7 @@ class CiderAgentService:
             raise CiderValidationError("source must be 'library', 'catalog', or 'default'.")
         if index >= len(items):
             raise CiderValidationError("Search result index was out of range.")
-        play_params = items[index].get("play_params", {})
-        item_id = str(play_params.get("id", "")).strip()
-        kind = str(play_params.get("kind", "songs")).strip() or "songs"
-        is_library = bool(play_params.get("is_library", source == "library"))
-        if not item_id:
-            raise CiderValidationError("Selected search result did not include a playable id.")
-        return self.play_item(item_id, kind=kind, is_library=is_library)
+        return self._play_flattened_track(items[index], is_library_default=source == "library")
 
     def list_preferences(self) -> dict[str, Any]:
         preferences = self._preferences.list_preferences()
@@ -3002,7 +3001,7 @@ class CiderAgentService:
         is_library = bool(play_params.get("is_library", is_library_default))
         if not item_id:
             raise CiderValidationError("Resolved track did not include a playable id.")
-        return self.play_item(item_id, kind=kind, is_library=is_library)
+        return self.play_item(item_id, kind=kind, is_library=is_library, track=track)
 
     def _enqueue_flattened_track(self, track: dict[str, Any]) -> dict[str, Any]:
         play_params = track.get("play_params", {})

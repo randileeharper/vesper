@@ -199,6 +199,48 @@ def test_service_captures_full_domain_event_set_and_manifest_matches(settings: S
     assert started["correlationid"] == selected["correlationid"]
 
 
+def test_flattened_track_playback_event_includes_known_metadata(settings: Settings, tmp_path: Path) -> None:
+    sink = FakeHistorianSink()
+    service = _service(settings, sink, tmp_path)
+
+    service.play_search_result(query="k-pop", source="catalog")
+
+    event = next(event for event in sink.events if event["type"] == "music.playback.started")
+    assert event["data"]["track"]["title"] == "k-pop"
+    assert event["data"]["track"]["artist"] == "Catalog Artist"
+
+
+def test_direct_id_only_play_item_remains_compatible(settings: Settings, tmp_path: Path) -> None:
+    sink = FakeHistorianSink()
+    service = _service(settings, sink, tmp_path)
+
+    service.play_item("catalog-track-1")
+
+    event = next(event for event in sink.events if event["type"] == "music.playback.started")
+    assert event["data"]["track"] == {
+        "id": "catalog-track-1",
+        "title": None,
+        "artist": None,
+        "album": None,
+        "kind": "songs",
+        "is_library": False,
+    }
+
+
+def test_adaptive_session_playback_event_includes_selected_track_metadata(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    sink = FakeHistorianSink()
+    service = _service(settings, sink, tmp_path)
+
+    service.play_session("play upbeat music")
+
+    event = next(event for event in sink.events if event["type"] == "music.playback.started")
+    assert event["data"]["track"]["title"] == "Liked Song"
+    assert event["data"]["track"]["artist"] == "Favorite Artist"
+
+
 def test_cli_and_a2a_emit_once_at_service_boundary(
     settings: Settings,
     tmp_path: Path,
