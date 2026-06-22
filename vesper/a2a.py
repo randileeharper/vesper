@@ -311,7 +311,7 @@ class CiderAgentExecutor(AgentExecutor):
         )
 
         try:
-            result = _execute_inspection(inspection, correlation_id=task_id)
+            result = await asyncio.to_thread(_execute_inspection, inspection, correlation_id=task_id)
         except TextRequestExecutionError as exc:
             payload = dict(exc.payload)
             agent_message = _agent_message(

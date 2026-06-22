@@ -22,3 +22,22 @@ def test_run_amapi_v3_supports_method_and_body(rpc_client) -> None:
         "method": "POST",
         "body": {"attributes": {"name": "Mix"}},
     }
+
+
+def test_search_catalog_passes_through_valid_storefront(rpc_client) -> None:
+    client, session = rpc_client
+
+    client.search_catalog("some query", storefront="jp")
+
+    assert session.requests[0]["json"]["path"].startswith("/v1/catalog/jp/search")
+
+
+def test_search_catalog_rejects_unsafe_storefront(rpc_client) -> None:
+    client, session = rpc_client
+
+    client.search_catalog("some query", storefront="../../admin")
+
+    path = session.requests[0]["json"]["path"]
+    assert path.startswith("/v1/catalog/us/search")
+    assert "../" not in path
+    assert "admin" not in path

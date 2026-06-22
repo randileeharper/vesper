@@ -1626,6 +1626,51 @@ def test_play_candidate_match_does_not_treat_artist_as_one_track(service) -> Non
         service.run_action("play_candidate_match", {"candidate_artists": ["RADWIMPS"]})
 
 
+def test_play_candidate_match_falls_through_failed_query(settings) -> None:
+    class _QueryFallbackRpc:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def close(self) -> None:
+            return None
+
+        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+            self.queries.append(query)
+            if query == "hit":
+                return {
+                    "data": {
+                        "results": {
+                            "songs": {
+                                "data": [
+                                    {
+                                        "id": "hit-track",
+                                        "type": "songs",
+                                        "attributes": {
+                                            "name": "Hit Song",
+                                            "artistName": "Hit Artist",
+                                            "playParams": {"id": "hit-track", "kind": "songs", "isLibrary": False},
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {"data": {"results": {"songs": {"data": []}}}}
+
+        def playback_post(self, path: str, body=None):
+            return {"path": path, "body": body}
+
+    rpc = _QueryFallbackRpc()
+    fallback_service = CiderAgentService(settings, rpc_client=rpc)
+
+    result = fallback_service.play_candidate_match(candidate_queries=["miss", "hit"])
+
+    assert result["selection_strategy"] == "candidate_query_fallback"
+    assert result["selected_query"] == "hit"
+    assert rpc.queries == ["miss", "hit"]
+
+
 def test_collect_session_tracks_uses_track_artist_as_fallback_artist(settings, service, tmp_path) -> None:
     class RadwimpsRpcClient:
         def close(self) -> None:

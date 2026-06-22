@@ -1416,7 +1416,10 @@ class CiderAgentService:
             query_text = str(query).strip()
             if not query_text:
                 continue
-            result = self._play_search_result_from_pool(query=query_text, source="default", storefront=storefront)
+            try:
+                result = self._play_search_result_from_pool(query=query_text, source="default", storefront=storefront)
+            except CiderAgentError:
+                continue
             return {
                 "status": "ok",
                 "selection_strategy": "candidate_query_fallback",

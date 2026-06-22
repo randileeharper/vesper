@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -9,6 +10,21 @@ import httpx
 
 from .config import Settings
 from .errors import CiderRpcError
+
+
+_STOREFRONT_RE = re.compile(r"^[A-Za-z]{2,3}$")
+
+
+def _sanitize_storefront(storefront: str) -> str:
+    """Return a safe Apple Music storefront code, falling back to ``us``.
+
+    Storefront is interpolated into an AMaPI catalog path. Restrict it to a
+    short alphabetic code so resolver/action-supplied values cannot inject path
+    segments or query characters. The search term itself is already URL-quoted.
+    """
+    if isinstance(storefront, str) and _STOREFRONT_RE.match(storefront):
+        return storefront
+    return "us"
 
 
 class CiderRpcClient:
@@ -56,7 +72,8 @@ class CiderRpcClient:
 
     def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> Any:
         encoded_query = quote(query, safe="")
-        path = f"/v1/catalog/{storefront}/search?term={encoded_query}&types=songs&limit={limit}"
+        safe_storefront = _sanitize_storefront(storefront)
+        path = f"/v1/catalog/{safe_storefront}/search?term={encoded_query}&types=songs&limit={limit}"
         if offset:
             path = f"{path}&offset={offset}"
         return self.run_amapi_v3(path)
