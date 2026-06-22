@@ -24,7 +24,6 @@ from vesper.output import (
     compact_session_refill_result,
     compact_session_status,
     compact_track,
-    extract_execution_timings,
     finalize_output,
     looks_like_album,
     looks_like_artist,
@@ -290,21 +289,6 @@ def test_summarize_execution_unknown_falls_back_to_action():
 
 def test_summarize_execution_empty_action():
     assert summarize_execution({"action": "", "result": {}}) == "completed"
-
-
-# --- extract_execution_timings (currently unused; pinned for completeness) -
-
-
-def test_extract_execution_timings_top_level():
-    assert extract_execution_timings({"result": {"timings": {"a": 1}}}) == {"a": 1}
-
-
-def test_extract_execution_timings_nested():
-    assert extract_execution_timings({"result": {"result": {"timings": {"b": 2}}}}) == {"b": 2}
-
-
-def test_extract_execution_timings_none():
-    assert extract_execution_timings({"result": {}}) is None
 
 
 # --- composite compacters (direct) ----------------------------------------

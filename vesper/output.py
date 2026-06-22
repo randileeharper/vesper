@@ -265,20 +265,6 @@ def summarize_execution(execution: dict[str, Any]) -> str:
     return action or "completed"
 
 
-def extract_execution_timings(execution: dict[str, Any]) -> dict[str, Any] | None:
-    result = execution.get("result")
-    if isinstance(result, dict):
-        timings = result.get("timings")
-        if isinstance(timings, dict):
-            return timings
-        nested = result.get("result")
-        if isinstance(nested, dict):
-            nested_timings = nested.get("timings")
-            if isinstance(nested_timings, dict):
-                return nested_timings
-    return None
-
-
 # --- settings-gated entry points --------------------------------------------
 
 
