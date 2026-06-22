@@ -43,6 +43,12 @@ from .output import (
     finalize_output,
     summarize_execution,
 )
+from .validation import (
+    validate_index,
+    validate_limit_offset,
+    validate_playlist_id,
+    validate_search,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -706,15 +712,15 @@ class CiderAgentService:
         return {"status": "ok", "result": self._rpc.playback_post("/play-later", item)}
 
     def move_queue_item(self, from_index: int, to_index: int) -> dict[str, Any]:
-        self._validate_index(from_index, "from_index")
-        self._validate_index(to_index, "to_index")
+        validate_index(from_index, "from_index")
+        validate_index(to_index, "to_index")
         return {
             "status": "ok",
             "result": self._rpc.playback_post("/queue/move-to-position", {"fromIndex": from_index, "toIndex": to_index}),
         }
 
     def remove_queue_item(self, index: int) -> dict[str, Any]:
-        self._validate_index(index, "index")
+        validate_index(index, "index")
         return {"status": "ok", "result": self._rpc.playback_post("/queue/remove-by-index", {"index": index})}
 
     def clear_queue(self) -> dict[str, Any]:
@@ -761,7 +767,7 @@ class CiderAgentService:
         return {"status": "ok", "result": self._rpc.playback_post("/play-item-href", {"href": href})}
 
     def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
-        self._validate_limit_offset(limit, offset)
+        validate_limit_offset(limit, offset)
         if not query.strip():
             raise CiderValidationError("query cannot be empty.")
         payload = self._rpc.search_catalog(query=query, limit=limit, storefront=storefront, offset=offset)
@@ -870,7 +876,7 @@ class CiderAgentService:
         return result
 
     def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None) -> dict[str, Any]:
-        self._validate_search(query, limit)
+        validate_search(query, limit)
         payload = self._rpc.search_library(query=query, limit=limit, types=types)
         results = payload.get("data", {}).get("results", {}) if isinstance(payload, dict) else {}
         tracks = results.get("library-songs", {}).get("data", [])
@@ -895,7 +901,7 @@ class CiderAgentService:
         }
 
     def search_library_tracks(self, query: str, *, limit: int = 10) -> dict[str, Any]:
-        self._validate_search(query, limit)
+        validate_search(query, limit)
         payload = self._rpc.run_amapi_v3(f"/v1/me/library/search?term={_encode_query(query)}&types=library-songs&limit={limit}")
         items = payload.get("data", {}).get("results", {}).get("library-songs", {}).get("data", [])
         return {
@@ -907,7 +913,7 @@ class CiderAgentService:
         }
 
     def list_library_playlists(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
-        self._validate_limit_offset(limit, offset)
+        validate_limit_offset(limit, offset)
         path = f"/v1/me/library/playlists?limit={limit}"
         if offset:
             path = f"{path}&offset={offset}"
@@ -922,7 +928,7 @@ class CiderAgentService:
         }
 
     def search_library_playlists(self, query: str, *, limit: int = 10) -> dict[str, Any]:
-        self._validate_search(query, limit)
+        validate_search(query, limit)
         payload = self._rpc.run_amapi_v3(
             f"/v1/me/library/search?term={_encode_query(query)}&types=library-playlists&limit={limit}"
         )
@@ -936,7 +942,7 @@ class CiderAgentService:
         }
 
     def get_library_playlist(self, playlist_id: str) -> dict[str, Any]:
-        self._validate_playlist_id(playlist_id)
+        validate_playlist_id(playlist_id)
         payload = self._rpc.run_amapi_v3(f"/v1/me/library/playlists/{playlist_id}")
         items = payload.get("data", {}).get("data", [])
         playlist = items[0] if isinstance(items, list) and items else {}
@@ -947,8 +953,8 @@ class CiderAgentService:
         }
 
     def get_library_playlist_tracks(self, playlist_id: str, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
-        self._validate_playlist_id(playlist_id)
-        self._validate_limit_offset(limit, offset)
+        validate_playlist_id(playlist_id)
+        validate_limit_offset(limit, offset)
         path = f"/v1/me/library/playlists/{playlist_id}/tracks?limit={limit}"
         if offset:
             path = f"{path}&offset={offset}"
@@ -984,7 +990,7 @@ class CiderAgentService:
         }
 
     def list_recently_played(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
-        self._validate_limit_offset(limit, offset)
+        validate_limit_offset(limit, offset)
         path = f"/v1/me/recent/played/tracks?limit={limit}"
         if offset:
             path = f"{path}&offset={offset}"
@@ -1005,8 +1011,8 @@ class CiderAgentService:
         index: int = 0,
         storefront: str = "us",
     ) -> dict[str, Any]:
-        self._validate_search(query, 25)
-        self._validate_index(index, "index")
+        validate_search(query, 25)
+        validate_index(index, "index")
         if source == "library":
             results = self.search_library_tracks(query, limit=25)
             items = results["tracks"]
@@ -2853,56 +2859,6 @@ class CiderAgentService:
             if "is_playing" in payload:
                 return bool(payload["is_playing"])
         return None
-
-    def _validate_search(self, query: str, limit: int) -> None:
-        if not query.strip():
-            raise CiderValidationError("query cannot be empty.")
-        if limit <= 0 or limit > 100:
-            raise CiderValidationError("limit must be between 1 and 100.")
-
-    def _validate_index(self, value: int, name: str) -> None:
-        if value < 0:
-            raise CiderValidationError(f"{name} must be non-negative.")
-
-    def _validate_limit_offset(self, limit: int, offset: int) -> None:
-        if limit <= 0 or limit > 100:
-            raise CiderValidationError("limit must be between 1 and 100.")
-        if offset < 0:
-            raise CiderValidationError("offset must be non-negative.")
-
-    def _validate_playlist_id(self, playlist_id: str) -> None:
-        if not playlist_id.strip():
-            raise CiderValidationError("playlist_id cannot be empty.")
-
-    def _coerce_volume_param(self, params: dict[str, Any]) -> int:
-        raw = None
-        for key in ("volume", "value", "level", "percent"):
-            if key in params:
-                raw = params[key]
-                break
-        if raw is None:
-            raise CiderValidationError("set_volume requires a volume parameter.")
-        if isinstance(raw, str):
-            raw = raw.strip()
-            if not raw:
-                raise CiderValidationError("volume cannot be empty.")
-            numeric = float(raw)
-            if "." in raw and 0.0 <= numeric <= 1.0:
-                return round(numeric * 100)
-            return round(numeric)
-        if isinstance(raw, (int, float)):
-            numeric = float(raw)
-            if isinstance(raw, float) and 0.0 <= numeric <= 1.0:
-                return round(numeric * 100)
-            return round(numeric)
-        raise CiderValidationError(f"volume must be numeric, got {type(raw).__name__}.")
-
-    def _normalize_track_ref(self, ref: dict[str, str]) -> dict[str, str]:
-        item_id = str(ref.get("id", "")).strip()
-        item_type = str(ref.get("type", "songs")).strip() or "songs"
-        if not item_id:
-            raise CiderValidationError("Each track ref must include a non-empty id.")
-        return {"id": item_id, "type": item_type}
 
     def _best_track_match(self, tracks: list[dict[str, Any]], *, title: str, artist: str) -> dict[str, Any] | None:
         title_norm = _normalize_match_text(title)

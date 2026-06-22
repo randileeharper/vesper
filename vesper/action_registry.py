@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import re
 from typing import Any, Callable
 
+from .validation import coerce_volume_param
+
 
 ActionExecutor = Callable[[Any, dict[str, Any]], Any]
 
@@ -95,7 +97,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         "set_volume",
         "Set the playback volume.",
         "set volume",
-        lambda service, params: service.set_volume(service._coerce_volume_param(params)),
+        lambda service, params: service.set_volume(coerce_volume_param(params)),
         parameter_schema={"volume": {"type": "number"}},
     ),
     _definition("get_repeat_mode", "Get the repeat mode.", "repeat mode", lambda service, params: service.get_repeat_mode(), read_only=True, advanced_only=True),
