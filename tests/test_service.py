@@ -407,6 +407,7 @@ def test_status_is_trimmed_and_includes_queue_tracks(service) -> None:
     assert status["queue"]["count"] == 1
     assert status["queue"]["tracks"][0]["title"] == "Queued"
     assert "id" not in status["queue"]["tracks"][0]
+    assert service._rpc.playback_get_calls.count("/queue") == 1
 
 
 def test_next_track_advances_active_session_without_native_queue(service) -> None:

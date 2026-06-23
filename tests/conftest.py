@@ -58,6 +58,7 @@ class StubRpcClient:
         )
         self.queue_items = [self._track("queued-track", "Queued", "Queued Artist", "Queued Album")]
         self.posts: list[dict[str, Any]] = []
+        self.playback_get_calls: list[str] = []
         self.search_catalog_calls: list[dict[str, Any]] = []
 
     def _track(
@@ -85,6 +86,7 @@ class StubRpcClient:
         return None
 
     def playback_get(self, path: str):
+        self.playback_get_calls.append(path)
         if path == "/now-playing":
             return {"info": self.current_track["attributes"] if self.current_track is not None else {}}
         if path == "/queue":

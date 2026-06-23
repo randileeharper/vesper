@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import wraps
 import logging
@@ -433,7 +434,7 @@ class CiderAgentService:
             "preferences_count": len(self._preferences.list_preferences()),
         }
         if self.response_detail() == "compact":
-            queue = self.get_queue()
+            queue = payload["playback"].get("queue", {})
             session = self._preferences.get_active_session()
             return {
                 "status": "ok",
@@ -442,13 +443,13 @@ class CiderAgentService:
                     "is_playing": payload["playback"].get("is_playing"),
                     "track": compact_track(payload["playback"].get("track", {})),
                     "volume": payload["playback"].get("volume"),
-                    "queue_length": queue.get("count", 0),
+                    "queue_length": queue.get("count", 0) if isinstance(queue, dict) else 0,
                 },
                 "queue": {
-                    "count": queue.get("count", 0),
+                    "count": queue.get("count", 0) if isinstance(queue, dict) else 0,
                     "tracks": [
                         compact_track(item["track"])
-                        for item in queue.get("items", [])[:5]
+                        for item in (queue.get("items", []) if isinstance(queue, dict) else [])[:5]
                         if isinstance(item, dict) and isinstance(item.get("track"), dict)
                     ],
                 },
@@ -474,14 +475,31 @@ class CiderAgentService:
         }
 
     def playback_snapshot(self) -> dict[str, Any]:
-        is_playing_payload = self._rpc.playback_get("/is-playing")
-        now_playing_payload = self._rpc.playback_get("/now-playing")
-        volume_payload = self._rpc.playback_get("/volume")
-        queue_payload = self._rpc.playback_get("/queue")
-        repeat_payload = self._rpc.playback_get("/repeat-mode")
-        shuffle_payload = self._rpc.playback_get("/shuffle-mode")
-        autoplay_payload = self._rpc.playback_get("/autoplay")
+        snapshot_paths = {
+            "is_playing": "/is-playing",
+            "now_playing": "/now-playing",
+            "volume": "/volume",
+            "queue": "/queue",
+            "repeat": "/repeat-mode",
+            "shuffle": "/shuffle-mode",
+            "autoplay": "/autoplay",
+        }
+        with ThreadPoolExecutor(max_workers=len(snapshot_paths)) as executor:
+            payloads = {
+                name: future.result()
+                for name, future in {
+                    name: executor.submit(self._rpc.playback_get, path) for name, path in snapshot_paths.items()
+                }.items()
+            }
+        is_playing_payload = payloads["is_playing"]
+        now_playing_payload = payloads["now_playing"]
+        volume_payload = payloads["volume"]
+        queue_payload = payloads["queue"]
+        repeat_payload = payloads["repeat"]
+        shuffle_payload = payloads["shuffle"]
+        autoplay_payload = payloads["autoplay"]
         info = now_playing_payload.get("info", {}) if isinstance(now_playing_payload, dict) else {}
+        queue = self._queue_result(queue_payload)
         return {
             "status": "ok",
             "source": "cider-rpc",
@@ -501,7 +519,8 @@ class CiderAgentService:
             "repeat_mode": repeat_payload.get("value") if isinstance(repeat_payload, dict) else None,
             "shuffle_mode": shuffle_payload.get("value") if isinstance(shuffle_payload, dict) else None,
             "autoplay": autoplay_payload.get("value") if isinstance(autoplay_payload, dict) else None,
-            "queue_length": len(queue_payload) if isinstance(queue_payload, list) else 0,
+            "queue_length": queue["count"],
+            "queue": queue,
         }
 
     def is_playing(self) -> dict[str, Any]:
@@ -649,7 +668,9 @@ class CiderAgentService:
         return {"status": "ok", "result": self._rpc.playback_post("/toggle-autoplay")}
 
     def get_queue(self) -> dict[str, Any]:
-        payload = self._rpc.playback_get("/queue")
+        return self._queue_result(self._rpc.playback_get("/queue"))
+
+    def _queue_result(self, payload: Any) -> dict[str, Any]:
         items = payload if isinstance(payload, list) else []
         return {
             "status": "ok",
