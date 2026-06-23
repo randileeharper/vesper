@@ -158,6 +158,9 @@ class SessionHost(Protocol):
     def session_recent_tracks_limit(self) -> int:
         ...
 
+    def session_vibe_rephrase_attempts(self) -> int:
+        ...
+
     def global_recent_tracks_limit(self) -> int:
         ...
 
@@ -1287,46 +1290,7 @@ class SessionEngine:
                 tracks = self._host._catalog_relationship_tracks(f"/charts?types=songs&genre={_encode_query(genre_id)}")
                 return tracks, {"resolved_genre_id": genre_id, "resolved_name": source.term}
             if source.kind == "vibe":
-                playlists = self._host._catalog_resource_search(source.term, resource_type="playlists", limit=5)
-                candidates = [self._playlist_selection_candidate(item) for item in playlists]
-                self._host.append_session_debug_log(
-                    stage="session_playlist_candidates",
-                    payload={
-                        "session_id": session.get("id"),
-                        "search_source": {"kind": source.kind, "term": source.term},
-                        "candidates": candidates,
-                    },
-                )
-                if not candidates:
-                    return [], {}
-                chooser = getattr(self._host._resolver, "select_session_playlist", None)
-                selection = (
-                    chooser(self._session_effective_request(session), self._host, session, source, candidates)
-                    if callable(chooser)
-                    else SessionTrackSelection(selected_index=0, resolver="fallback")
-                )
-                if selection.selected_index < 0:
-                    return [], {}
-                selected_index = min(selection.selected_index, len(playlists) - 1)
-                playlist = playlists[selected_index]
-                playlist_id = _clean_id(playlist.get("id"))
-                if not playlist_id:
-                    return [], {}
-                tracks = self._host._catalog_relationship_tracks(f"/playlists/{playlist_id}/tracks")
-                metadata = {
-                    "resolved_playlist_id": playlist_id,
-                    "resolved_name": playlist.get("attributes", {}).get("name"),
-                }
-                self._host.append_session_debug_log(
-                    stage="session_playlist_selected",
-                    payload={
-                        "session_id": session.get("id"),
-                        "search_source": {"kind": source.kind, "term": source.term},
-                        "selected_index": selected_index,
-                        "playlist": candidates[selected_index],
-                    },
-                )
-                return tracks, metadata
+                return self._fetch_vibe_session_source_results(session, source)
             if source.kind == "preference":
                 return [], {}
             if source.kind == "legacy":
@@ -1346,6 +1310,110 @@ class SessionEngine:
             return [], {}
         finally:
             self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
+
+    def _fetch_vibe_session_source_results(
+        self,
+        session: dict[str, Any],
+        source: SessionSearchSource,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        attempted_terms: list[str] = []
+        max_attempts = max(1, self._host.session_vibe_rephrase_attempts())
+        for attempt in range(1, max_attempts + 1):
+            term = source.term if attempt == 1 else self._rephrase_session_vibe(session, source, attempted_terms)
+            if not term:
+                break
+            attempted_terms.append(term)
+            attempt_source = SessionSearchSource(kind="vibe", term=term)
+            if attempt > 1:
+                self._debug_candidate_query_search_count += 1
+            playlists = self._host._catalog_resource_search(term, resource_type="playlists", limit=5)
+            candidates = [self._playlist_selection_candidate(item) for item in playlists]
+            self._host.append_session_debug_log(
+                stage="session_playlist_candidates",
+                payload={
+                    "session_id": session.get("id"),
+                    "search_source": {"kind": attempt_source.kind, "term": attempt_source.term},
+                    "original_search_source": {"kind": source.kind, "term": source.term},
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "candidates": candidates,
+                },
+            )
+            if not candidates:
+                self._host.append_session_debug_log(
+                    stage="session_vibe_rephrase_attempt",
+                    payload={
+                        "session_id": session.get("id"),
+                        "original_term": source.term,
+                        "attempted_term": term,
+                        "attempt": attempt,
+                        "result": "empty_playlist_search",
+                    },
+                )
+                continue
+            chooser = getattr(self._host._resolver, "select_session_playlist", None)
+            selection = (
+                chooser(self._session_effective_request(session), self._host, session, attempt_source, candidates)
+                if callable(chooser)
+                else SessionTrackSelection(selected_index=0, resolver="fallback")
+            )
+            if selection.selected_index < 0:
+                return [], {}
+            selected_index = min(selection.selected_index, len(playlists) - 1)
+            playlist = playlists[selected_index]
+            playlist_id = _clean_id(playlist.get("id"))
+            if not playlist_id:
+                return [], {}
+            tracks = self._host._catalog_relationship_tracks(f"/playlists/{playlist_id}/tracks")
+            metadata = {
+                "resolved_playlist_id": playlist_id,
+                "resolved_name": playlist.get("attributes", {}).get("name"),
+            }
+            if attempt_source.term != source.term:
+                metadata["resolved_vibe_term"] = attempt_source.term
+            self._host.append_session_debug_log(
+                stage="session_playlist_selected",
+                payload={
+                    "session_id": session.get("id"),
+                    "search_source": {"kind": attempt_source.kind, "term": attempt_source.term},
+                    "original_search_source": {"kind": source.kind, "term": source.term},
+                    "selected_index": selected_index,
+                    "playlist": candidates[selected_index],
+                },
+            )
+            return tracks, metadata
+        return [], {}
+
+    def _rephrase_session_vibe(
+        self,
+        session: dict[str, Any],
+        source: SessionSearchSource,
+        attempted_terms: list[str],
+    ) -> str | None:
+        rephraser = getattr(self._host._resolver, "rephrase_session_vibe", None)
+        if callable(rephraser):
+            candidate = str(
+                rephraser(self._session_effective_request(session), self._host, session, source, list(attempted_terms))
+                or ""
+            ).strip()
+            if candidate and candidate.casefold() not in {term.casefold() for term in attempted_terms}:
+                return candidate
+        return self._fallback_vibe_rephrase(source.term, attempted_terms)
+
+    def _fallback_vibe_rephrase(self, term: str, attempted_terms: list[str]) -> str | None:
+        seen = {item.casefold() for item in attempted_terms}
+        words = [word for word in str(term).replace("-", " ").split() if word]
+        candidates: list[str] = []
+        if len(words) > 2:
+            candidates.append(" ".join(words[:2]))
+        if len(words) > 1:
+            candidates.append(words[-1])
+        candidates.extend(["chill", "upbeat", "focus", "workout", "party"])
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if normalized and normalized.casefold() not in seen:
+                return normalized
+        return None
 
     def _playlist_selection_candidate(self, item: dict[str, Any]) -> dict[str, Any]:
         playlist = _flatten_playlist_item(item)

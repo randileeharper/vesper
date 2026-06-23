@@ -22,6 +22,7 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
                     "include_timing_debug": True,
                     "response_detail": "debug",
                     "session_recent_tracks_limit": 12,
+                    "session_vibe_rephrase_attempts": 4,
                     "global_recent_tracks_limit": 34,
                     "database_path": str(tmp_path / "db.sqlite3"),
                 }
@@ -41,6 +42,7 @@ def test_settings_reads_config_file(tmp_path, monkeypatch) -> None:
     assert settings.include_timing_debug is True
     assert settings.response_detail == "debug"
     assert settings.session_recent_tracks_limit == 12
+    assert settings.session_vibe_rephrase_attempts == 4
     assert settings.global_recent_tracks_limit == 34
     assert settings.database_path == tmp_path / "db.sqlite3"
 

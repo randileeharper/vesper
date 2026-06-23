@@ -115,6 +115,70 @@ def test_vibe_source_selects_playlist_once_and_keeps_playlist_order(service, mon
     assert [entry["track"]["title"] for entry in pool["entries"]] == ["First", "Second"]
 
 
+def test_vibe_source_rephrases_empty_playlist_search_before_failing(service, monkeypatch) -> None:
+    searches: list[str] = []
+    rephrase_calls: list[list[str]] = []
+
+    class Resolver:
+        def rephrase_session_vibe(self, request, service, session, source, attempted_terms):
+            rephrase_calls.append(attempted_terms)
+            return "focus" if attempted_terms == ["oddly specific productivity fog"] else None
+
+        def select_session_playlist(self, request, service, session, source, candidates):
+            return SessionTrackSelection(selected_index=0, resolver="stub")
+
+    def search(term: str, *, resource_type: str, limit: int, storefront: str = "us"):
+        searches.append(term)
+        if term == "focus":
+            return [{"id": "playlist-focus", "type": "playlists", "attributes": {"name": "Focus"}}]
+        return []
+
+    service._resolver = Resolver()
+    monkeypatch.setattr(service, "_catalog_resource_search", search)
+    monkeypatch.setattr(
+        service,
+        "_catalog_relationship_tracks",
+        lambda path, storefront="us": [_track("song-1", "Deep Work", "Artist")],
+    )
+
+    pool = service._build_session_query_pool(
+        {"id": 1, "request_text": "play oddly specific productivity fog"},
+        SessionSearchSource(kind="vibe", term="oddly specific productivity fog"),
+    )
+
+    assert searches == ["oddly specific productivity fog", "focus"]
+    assert rephrase_calls == [["oddly specific productivity fog"]]
+    assert pool["resolved_playlist_id"] == "playlist-focus"
+    assert pool["resolved_vibe_term"] == "focus"
+    assert pool["entries"][0]["track"]["title"] == "Deep Work"
+
+
+def test_vibe_source_uses_fallback_rephrase_when_resolver_has_no_alternate(service, monkeypatch) -> None:
+    searches: list[str] = []
+
+    def search(term: str, *, resource_type: str, limit: int, storefront: str = "us"):
+        searches.append(term)
+        if term == "fog":
+            return [{"id": "playlist-fog", "type": "playlists", "attributes": {"name": "Fog"}}]
+        return []
+
+    monkeypatch.setattr(service, "_catalog_resource_search", search)
+    monkeypatch.setattr(
+        service,
+        "_catalog_relationship_tracks",
+        lambda path, storefront="us": [_track("song-1", "Haze", "Artist")],
+    )
+
+    pool = service._build_session_query_pool(
+        {"id": 1, "request_text": "play oddly specific productivity fog"},
+        SessionSearchSource(kind="vibe", term="oddly specific productivity fog"),
+    )
+
+    assert searches == ["oddly specific productivity fog", "oddly specific", "fog"]
+    assert pool["resolved_playlist_id"] == "playlist-fog"
+    assert pool["resolved_vibe_term"] == "fog"
+
+
 def test_typed_steering_adds_heterogeneous_sources(service) -> None:
     runtime = {
         "active_search_sources": [{"kind": "genre", "term": "Pop"}],

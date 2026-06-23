@@ -89,6 +89,7 @@ class Settings:
     include_timing_debug: bool = False
     response_detail: str = "compact"
     session_recent_tracks_limit: int = 10
+    session_vibe_rephrase_attempts: int = 3
     global_recent_tracks_limit: int = 10
     request_timeout_seconds: float = 60.0
     verify_tls: bool = True
@@ -175,6 +176,14 @@ class Settings:
                 10,
             )
         )
+        session_vibe_rephrase_attempts = int(
+            _config_or_env(
+                config,
+                "VESPER_SESSION_VIBE_REPHRASE_ATTEMPTS",
+                "session_vibe_rephrase_attempts",
+                3,
+            )
+        )
         global_recent_tracks_limit = int(
             _config_or_env(
                 config,
@@ -255,6 +264,8 @@ class Settings:
             raise CiderConfigError("response_detail must be either 'compact' or 'debug'.")
         if session_recent_tracks_limit <= 0 or session_recent_tracks_limit > 200:
             raise CiderConfigError("session_recent_tracks_limit must be between 1 and 200.")
+        if session_vibe_rephrase_attempts < 1 or session_vibe_rephrase_attempts > 10:
+            raise CiderConfigError("session_vibe_rephrase_attempts must be between 1 and 10.")
         if global_recent_tracks_limit <= 0 or global_recent_tracks_limit > 500:
             raise CiderConfigError("global_recent_tracks_limit must be between 1 and 500.")
         if request_timeout_seconds <= 0:
@@ -287,6 +298,7 @@ class Settings:
             include_timing_debug=include_timing_debug,
             response_detail=response_detail,
             session_recent_tracks_limit=session_recent_tracks_limit,
+            session_vibe_rephrase_attempts=session_vibe_rephrase_attempts,
             global_recent_tracks_limit=global_recent_tracks_limit,
             request_timeout_seconds=request_timeout_seconds,
             verify_tls=verify_tls,
@@ -322,6 +334,7 @@ class Settings:
             "include_timing_debug": self.include_timing_debug,
             "response_detail": self.response_detail,
             "session_recent_tracks_limit": self.session_recent_tracks_limit,
+            "session_vibe_rephrase_attempts": self.session_vibe_rephrase_attempts,
             "global_recent_tracks_limit": self.global_recent_tracks_limit,
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,

@@ -387,6 +387,9 @@ class CiderAgentService:
     def session_recent_tracks_limit(self) -> int:
         return self._settings.session_recent_tracks_limit
 
+    def session_vibe_rephrase_attempts(self) -> int:
+        return self._settings.session_vibe_rephrase_attempts
+
     def global_recent_tracks_limit(self) -> int:
         return self._settings.global_recent_tracks_limit
 

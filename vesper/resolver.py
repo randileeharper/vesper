@@ -102,6 +102,16 @@ class Resolver(Protocol):
     ) -> SessionTrackSelection:
         """Choose one playlist from real catalog candidates."""
 
+    def rephrase_session_vibe(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        attempted_terms: list[str],
+    ) -> str | None:
+        """Return an alternate vibe playlist search term after empty results."""
+
 
 class FallbackResolver:
     """Minimal deterministic fallback for obvious direct commands."""
@@ -151,6 +161,16 @@ class FallbackResolver:
         candidates: list[dict[str, Any]],
     ) -> SessionTrackSelection:
         return SessionTrackSelection(selected_index=0, resolver="fallback")
+
+    def rephrase_session_vibe(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        attempted_terms: list[str],
+    ) -> str | None:
+        return None
 
 
 class OpenAICompatibleResolver:
@@ -326,6 +346,30 @@ class OpenAICompatibleResolver:
             raw_content=self._extract_raw_content(content),
         )
 
+    def rephrase_session_vibe(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        attempted_terms: list[str],
+    ) -> str | None:
+        headers = {"Content-Type": "application/json"}
+        if self._settings.resolver_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
+        messages = self._build_vibe_rephrase_messages(request, session, search_source, attempted_terms)
+        body, content, parsed = self._complete_parsed_json(messages, headers)
+        logger = getattr(service, "append_resolver_debug_log", None)
+        if callable(logger):
+            logger(stage="rephrase_session_vibe", messages=messages, response_body=body, response_content=content)
+        term = parsed.get("term")
+        if not isinstance(term, str) or not term.strip():
+            return None
+        normalized = term.strip()
+        if normalized.casefold() in {item.casefold() for item in attempted_terms}:
+            return None
+        return normalized[:120]
+
     def _build_messages(self, text: str, service: Any) -> list[dict[str, str]]:
         playback = service.playback_snapshot()
         active_session = service.session_status(include_recent_tracks=False, compact=False).get("session")
@@ -426,6 +470,31 @@ class OpenAICompatibleResolver:
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nChoose a playlist."},
+        ]
+
+    def _build_vibe_rephrase_messages(
+        self,
+        request: str,
+        session: dict[str, Any],
+        search_source: SessionSearchSource,
+        attempted_terms: list[str],
+    ) -> list[dict[str, str]]:
+        context = {
+            "session_request": session.get("request_text"),
+            "effective_request": request,
+            "failed_vibe_term": search_source.term,
+            "attempted_terms": attempted_terms,
+        }
+        system = (
+            "Rewrite a failed Apple Music playlist search term for an adaptive music-session vibe. "
+            "Return only JSON with shape {\"term\": string}. "
+            "Use a short, broader phrase suitable for playlist search. "
+            "Do not repeat any attempted_terms. "
+            "Preserve the user's core mood, activity, genre, or era."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nReturn a new term."},
         ]
 
     def _normalize_search_sources(self, value: Any) -> list[SessionSearchSource]:
