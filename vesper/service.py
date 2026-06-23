@@ -1319,16 +1319,6 @@ class CiderAgentService:
     def _play_session_track(self, session: dict[str, Any], *, selection_strategy: str) -> dict[str, Any]:
         return self._session._play_session_track(session, selection_strategy=selection_strategy)
 
-    def _collect_session_tracks(
-        self,
-        session: dict[str, Any],
-        plan: SessionQueryPlan,
-        *,
-        limit: int,
-        timings: dict[str, Any] | None = None,
-    ) -> tuple[list[dict[str, Any]], SessionSearchSource, SessionTrackSelection]:
-        return self._session._collect_session_tracks(session, plan, limit=limit, timings=timings)
-
     def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
         return self._session._normalize_session_search_update(value)
 

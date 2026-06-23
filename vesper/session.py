@@ -769,31 +769,6 @@ class SessionEngine:
             return str(session.get("request_text", "")).strip()
         return f"{session.get('request_text', '').strip()} Current steering: {steering_text}".strip()
 
-    def _collect_session_tracks(
-        self,
-        session: dict[str, Any],
-        plan: SessionQueryPlan,
-        *,
-        limit: int,
-        timings: dict[str, Any] | None = None,
-    ) -> tuple[list[dict[str, Any]], SessionSearchSource, SessionTrackSelection]:
-        chosen, search_source, selection = self._collect_session_tracks_from_pools(session, plan, limit=limit)
-
-        if timings is not None and self._host.include_timing_debug():
-            timings["candidate_track_search_count"] = getattr(self, "_debug_candidate_track_search_count", 0)
-            timings["candidate_track_search_ms"] = round(getattr(self, "_debug_candidate_track_search_ms", 0.0), 2)
-            timings["candidate_artist_search_count"] = getattr(self, "_debug_candidate_artist_search_count", 0)
-            timings["candidate_artist_search_ms"] = round(getattr(self, "_debug_candidate_artist_search_ms", 0.0), 2)
-            timings["candidate_query_search_count"] = getattr(self, "_debug_candidate_query_search_count", 0)
-            timings["candidate_query_search_ms"] = round(getattr(self, "_debug_candidate_query_search_ms", 0.0), 2)
-            timings["selected_track_count"] = len(chosen)
-            timings["selection_candidate_count"] = getattr(self, "_debug_selection_candidate_count", 0)
-            timings["query_pool_count"] = len(
-                self._normalize_session_query_pools(self._get_session_runtime(session["id"]).get("query_pools"))
-            )
-
-        return chosen, search_source, selection
-
     def _ensure_materialized_session_queue(self, session: dict[str, Any], plan: SessionQueryPlan) -> None:
         existing = self._preferences.list_session_queue(session["id"], limit=1)
         if existing:
@@ -1002,45 +977,6 @@ class SessionEngine:
             indices.append(item)
         return indices
 
-    def _collect_session_tracks_from_pools(
-        self,
-        session: dict[str, Any],
-        plan: SessionQueryPlan,
-        *,
-        limit: int,
-    ) -> tuple[list[dict[str, Any]], SessionSearchSource, SessionTrackSelection]:
-        self._debug_candidate_track_search_count = 0
-        self._debug_candidate_track_search_ms = 0.0
-        self._debug_candidate_artist_search_count = 0
-        self._debug_candidate_artist_search_ms = 0.0
-        self._debug_selection_candidate_count = 0
-        self._debug_candidate_query_search_count = 0
-        self._debug_candidate_query_search_ms = 0.0
-        empty_selection = SessionTrackSelection(selected_index=0, resolver="fallback")
-
-        search_sources = self._plan_search_sources(plan)
-        last_source = SessionSearchSource(kind="vibe", term="")
-        for source in search_sources:
-            last_source = source
-            source_key = self._session_source_key(source)
-            while True:
-                self._check_worker_cancelled()
-                window = self._next_session_candidate_window(session, source)
-                if not window:
-                    break
-                candidates = [entry["track"] for entry in window]
-                self._debug_selection_candidate_count = len(candidates)
-                selection = self._select_session_track(session, plan, source.term, candidates)
-                if selection.selected_index < 0:
-                    self._mark_session_selection_window_screened_out(session["id"], source_key, window)
-                    continue
-                chosen_index = min(selection.selected_index, len(candidates) - 1)
-                chosen_entry = window[chosen_index]
-                self._mark_session_track_played(session["id"], source_key, window, chosen_entry["index"])
-                return [chosen_entry["track"]][:limit], source, selection
-
-        return [], last_source, empty_selection
-
     def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {"mode": "preserve", "sources": []}
@@ -1164,19 +1100,6 @@ class SessionEngine:
             if match_id:
                 seen_ids.add(match_id)
         return filtered
-
-    def _select_session_track(
-        self,
-        session: dict[str, Any],
-        plan: SessionQueryPlan,
-        search_query: str,
-        candidates: list[dict[str, Any]],
-    ) -> SessionTrackSelection:
-        chooser = getattr(self._host._resolver, "select_session_track", None)
-        if not callable(chooser):
-            return SessionTrackSelection(selected_index=0, resolver="fallback")
-        request = self._session_effective_request(session)
-        return chooser(request, self._host, session, search_query, candidates)
 
     def _normalize_session_query_pools(self, value: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(value, dict):
