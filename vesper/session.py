@@ -38,6 +38,17 @@ from .service import (
 LOGGER = logging.getLogger(__name__)
 
 
+class SessionWorkerCancelled(Exception):
+    """Raised inside the session worker to cooperatively abort an in-flight
+    advance once :meth:`SessionEngine.stop_background_session_worker` has been
+    requested. The worker loop catches it and exits quietly (instead of logging
+    a refill failure), and ``_play_session_task``'s exception handler clears
+    ``advance_in_progress`` before re-raising, so cancellation never wedges the
+    session runtime. See issue #4."""
+
+    __slots__ = ()
+
+
 class SessionHost(Protocol):
     """Structural interface for the cross-cutting capabilities SessionEngine
     borrows from its host (the :class:`vesper.service.CiderAgentService`
@@ -172,6 +183,7 @@ class SessionEngine:
         self._settings = settings
         self._session_worker_thread: threading.Thread | None = None
         self._session_worker_stop = threading.Event()
+        self._worker_thread_ident: int | None = None
         self._session_worker_lock = threading.Lock()
         self._session_runtime_lock = threading.Lock()
         self._session_runtime: dict[int, dict[str, Any]] = {}
@@ -234,13 +246,13 @@ class SessionEngine:
                 subject="adaptive-session",
             )
 
-    def stop_background_session_worker(self) -> None:
+    def stop_background_session_worker(self, *, timeout: float = 1.0) -> None:
         with self._session_worker_lock:
             self._session_worker_stop.set()
             thread = self._session_worker_thread
             self._session_worker_thread = None
         if thread is not None and thread.is_alive():
-            thread.join(timeout=1.0)
+            thread.join(timeout=timeout)
         if thread is not None:
             with self._host.operation(caller="startup"):
                 self._host._emit(
@@ -503,10 +515,27 @@ class SessionEngine:
             "result": result,
         }
 
+    def _check_worker_cancelled(self) -> None:
+        """Raise :class:`SessionWorkerCancelled` if the background worker has
+        been asked to stop. Called at phase boundaries inside an advance so a
+        shutdown request is honored promptly (before the next HTTP call)
+        instead of running the full plan/collect/play chain — which lets
+        ``close()`` tear down the RPC/resolver/historian without the worker
+        still using them.
+
+        Confined to the worker thread (``_worker_thread_ident``): direct,
+        user-initiated advances (``play_session``, ``steer_session``, ...) run
+        on other threads and must never be cancelled, since the stop flag stays
+        set after a stop until the worker is restarted. See issue #4."""
+        if self._session_worker_stop.is_set() and threading.get_ident() == self._worker_thread_ident:
+            raise SessionWorkerCancelled()
+
     def _session_worker_loop(self) -> None:
+        self._worker_thread_ident = threading.get_ident()
         while not self._session_worker_stop.wait(self._host.SESSION_REFILL_INTERVAL_SECONDS):
             with self._host.operation(caller="worker"):
                 try:
+                    self._check_worker_cancelled()
                     session = self._preferences.get_active_session()
                     if session is None:
                         continue
@@ -518,12 +547,17 @@ class SessionEngine:
                             selection_strategy="adaptive-session-auto-advance",
                             debug_reason="adaptive-session-auto-advance",
                         )
+                except SessionWorkerCancelled:
+                    # Cooperative shutdown: exit the loop without logging a
+                    # failure. Any in-flight phase already cleared its state.
+                    break
                 except CiderValidationError as exc:
                     self._host._record_error("worker", "adaptive-session-auto-advance", exc)
                     LOGGER.warning("Adaptive session worker could not advance session: %s", exc)
                 except Exception as exc:
                     self._host._record_error("worker", "adaptive-session-refill", exc)
                     LOGGER.exception("Adaptive session worker failed during refill loop.")
+        self._worker_thread_ident = None
 
     def _play_session_track_with_debug_episode(
         self,
@@ -550,6 +584,7 @@ class SessionEngine:
             )
             self._persist_session_runtime(session["id"], suspended=False, last_advance_at=self._host.current_timestamp())
             try:
+                self._check_worker_cancelled()
                 playback_started_at = time.perf_counter()
                 playback = self._host.playback_snapshot()
                 timings["playback_snapshot_ms"] = _elapsed_ms(playback_started_at)
@@ -557,12 +592,15 @@ class SessionEngine:
                 record_current_started_at = time.perf_counter()
                 self._record_current_track_for_session(session, playback=playback)
                 timings["record_current_track_ms"] = _elapsed_ms(record_current_started_at)
+                self._check_worker_cancelled()
                 planning_started_at = time.perf_counter()
                 plan = self._plan_session_query(session, count=1)
                 timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
+                self._check_worker_cancelled()
                 collect_started_at = time.perf_counter()
                 tracks, search_source, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
                 if not tracks and getattr(plan, "resolver", "") != "preference-seeded":
+                    self._check_worker_cancelled()
                     self._reject_session_plan_sources(session["id"], plan)
                     replan_started_at = time.perf_counter()
                     plan = self._plan_session_query(session, count=1, force_replan=True)
@@ -575,6 +613,7 @@ class SessionEngine:
                     raise CiderValidationError("No playable candidate match could be resolved.")
                 lead_track = tracks[0]
                 public_search_kind = "vibe" if search_source.kind == "legacy" else search_source.kind
+                self._check_worker_cancelled()
                 play_started_at = time.perf_counter()
                 playback_result = self._host._play_flattened_track(lead_track, is_library_default=False)
                 timings["play_track_ms"] = _elapsed_ms(play_started_at)
@@ -734,6 +773,7 @@ class SessionEngine:
             last_source = source
             source_key = self._session_source_key(source)
             while True:
+                self._check_worker_cancelled()
                 window = self._next_session_candidate_window(session, source)
                 if not window:
                     break

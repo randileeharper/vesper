@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from vesper.action_registry import get_action_definition
@@ -7,6 +9,7 @@ from vesper.config import Settings
 from vesper.errors import CiderValidationError, TextRequestExecutionError
 from vesper.resolver import ResolvedAction, SessionSearchSource
 from vesper.service import CiderAgentService
+from vesper.session import SessionWorkerCancelled
 from vesper.storage import PreferenceStore
 
 
@@ -2168,3 +2171,105 @@ def test_session_events_distinguish_rejection_steering_skip_and_auto_advance(ser
     assert "track_rejected" in event_types
     assert "track_manual_skip" in event_types
     assert "track_auto_advanced" in event_types
+
+
+def test_check_worker_cancelled_signals_shutdown(service) -> None:
+    # No-op while running normally.
+    assert service._session._check_worker_cancelled() is None
+    service._session._session_worker_stop.set()
+    # Direct (non-worker-thread) calls are never cancelled, even once stopped.
+    assert service._session._check_worker_cancelled() is None
+    # On the worker thread, the stop flag is honored.
+    service._session._worker_thread_ident = threading.get_ident()
+    with pytest.raises(SessionWorkerCancelled):
+        service._session._check_worker_cancelled()
+
+
+def test_play_session_track_aborts_on_cancel_and_clears_advance_flag(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    # Simulate running on the worker thread, then request shutdown before the
+    # advance starts. The entry cancel check must abort before any HTTP work,
+    # and advance_in_progress must be cleared so the cancellation does not wedge
+    # the session runtime.
+    service._session._worker_thread_ident = threading.get_ident()
+    service._session._session_worker_stop.set()
+    with pytest.raises(SessionWorkerCancelled):
+        service._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
+
+    assert service._get_session_runtime(session["id"])["advance_in_progress"] is False
+
+
+def test_close_drains_worker_before_closing_clients(service, monkeypatch) -> None:
+    order: list[str] = []
+    seen_timeout: dict[str, float] = {}
+
+    original_stop = service.stop_background_session_worker
+
+    def spy_stop(*, timeout: float = 1.0) -> None:
+        seen_timeout["timeout"] = timeout
+        order.append("stop_worker")
+        original_stop(timeout=timeout)
+
+    monkeypatch.setattr(service, "stop_background_session_worker", spy_stop)
+    monkeypatch.setattr(service._rpc, "close", lambda: order.append("rpc_close"))
+    monkeypatch.setattr(service._resolver, "close", lambda: order.append("resolver_close"), raising=False)
+    monkeypatch.setattr(service._historian, "close", lambda: order.append("historian_close"))
+
+    service.close()
+
+    # The worker must be stopped (and joined) before any client is torn down,
+    # and close() must give the worker a join window that covers one in-flight
+    # request (request_timeout_seconds). See #4.
+    assert order == ["stop_worker", "rpc_close", "resolver_close", "historian_close"]
+    assert seen_timeout["timeout"] == service._settings.request_timeout_seconds
+
+
+def test_worker_exits_at_phase_boundary_on_cancel(service) -> None:
+    # Advance promptly instead of waiting out the full refill interval.
+    service.SESSION_REFILL_INTERVAL_SECONDS = 0.01
+
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    # Make the worker want to advance: playback stopped + stale last advance.
+    service._rpc.is_playing = False
+    service._rpc.current_track = None
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(
+        session["id"], last_advance_at="1970-01-01T00:00:00+00:00"
+    )
+
+    # Park the worker mid-collect (inside the resolver chooser) so the stop
+    # signal arrives while an advance is genuinely in flight.
+    gate = threading.Event()
+    entered_select = threading.Event()
+    original_select = service._resolver.select_session_track
+
+    def blocking_select(request, host, sess, search_query, candidates):
+        entered_select.set()
+        gate.wait(timeout=5.0)
+        return original_select(request, host, sess, search_query, candidates)
+
+    service._resolver.select_session_track = blocking_select
+
+    service.start_background_session_worker()
+    worker_thread = service._session_worker_thread
+    assert worker_thread is not None
+
+    # Wait until the worker is actually blocked mid-collect.
+    assert entered_select.wait(timeout=5.0)
+
+    # Request cooperative shutdown, then release the in-flight collect.
+    service._session._session_worker_stop.set()
+    gate.set()
+
+    # The worker must honor the stop at the next phase boundary (before play)
+    # instead of continuing through _play_flattened_track and the persist steps.
+    worker_thread.join(timeout=5.0)
+    assert not worker_thread.is_alive()
+    # Cancellation must clear advance_in_progress rather than wedging the session.
+    assert service._get_session_runtime(session["id"])["advance_in_progress"] is False

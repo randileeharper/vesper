@@ -227,7 +227,12 @@ class CiderAgentService:
         return self._session._session_runtime
 
     def close(self) -> None:
-        self.stop_background_session_worker()
+        # Stop the refill worker first and give it long enough to honor the
+        # cooperative cancel at its next phase boundary (at most one in-flight
+        # request, bounded by request_timeout_seconds) before tearing down the
+        # RPC client, resolver, and historian. Otherwise close() can close the
+        # very clients the worker thread is still using mid-advance. See #4.
+        self.stop_background_session_worker(timeout=self._settings.request_timeout_seconds)
         self._rpc.close()
         close = getattr(self._resolver, "close", None)
         if callable(close):
@@ -416,8 +421,8 @@ class CiderAgentService:
     def start_background_session_worker(self) -> None:
         self._session.start_background_session_worker()
 
-    def stop_background_session_worker(self) -> None:
-        self._session.stop_background_session_worker()
+    def stop_background_session_worker(self, *, timeout: float = 1.0) -> None:
+        self._session.stop_background_session_worker(timeout=timeout)
 
     def status(self) -> dict[str, Any]:
         payload = {
