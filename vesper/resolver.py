@@ -159,11 +159,6 @@ class FallbackResolver:
 
     def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionQueryPlan:
         query = request.strip()
-        if self._is_vague_play_request(query):
-            return SessionQueryPlan(
-                search_sources=[SessionSearchSource(kind="preference", term="__preference_seeded__")],
-                resolver="fallback",
-            )
         return SessionQueryPlan(
             search_sources=[SessionSearchSource(kind="vibe", term=query)] if query else [],
             resolver="fallback",
@@ -207,23 +202,6 @@ class FallbackResolver:
         candidates: list[dict[str, Any]],
     ) -> SessionQueueDecision:
         return SessionQueueDecision(eligible_indices=list(range(len(candidates))), resolver="fallback")
-
-    def _is_vague_play_request(self, value: Any) -> bool:
-        text = str(value or "").strip().casefold()
-        if not text:
-            return False
-        compact = re.sub(r"[^a-z0-9]+", " ", text)
-        compact = " ".join(compact.split())
-        return compact in {
-            "play music",
-            "play some music",
-            "play some songs",
-            "play something",
-            "play something good",
-            "play anything",
-            "some music",
-            "music please",
-        }
 
 
 class OpenAICompatibleResolver:
