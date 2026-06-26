@@ -37,6 +37,12 @@ from .service import (
 
 LOGGER = logging.getLogger(__name__)
 
+# Sentinel stored as ``pending_stop_track_id`` when Cider reports playback
+# stopped with no current track at all. Real track ids are numeric, so this
+# never collides; it lets the two-snapshot stop confirmation apply to the
+# no-track case exactly as it does to a known-but-ambiguous track.
+_PENDING_STOP_NO_TRACK_SENTINEL = "<missing>"
+
 
 class SessionWorkerCancelled(Exception):
     """Raised inside the session worker to cooperatively abort an in-flight
@@ -561,19 +567,31 @@ class SessionEngine:
         self._worker_thread_ident = threading.get_ident()
         while not self._session_worker_stop.wait(self._host.SESSION_REFILL_INTERVAL_SECONDS):
             with self._host.operation(caller="worker"):
+                started_debug_episode = False
                 try:
                     self._check_worker_cancelled()
                     session = self._preferences.get_active_session()
                     if session is None:
                         continue
                     playback = self._host.playback_snapshot()
+                    if playback.get("is_playing") is False:
+                        started_debug_episode = self._host._begin_resolver_debug_episode(
+                            "adaptive-session-auto-advance-check"
+                        )
                     self._record_current_track_for_session(session, playback=playback)
                     if self._should_advance_session(session, playback):
-                        self._play_session_track_with_debug_episode(
-                            session,
-                            selection_strategy="adaptive-session-auto-advance",
-                            debug_reason="adaptive-session-auto-advance",
+                        self._host.append_session_debug_log(
+                            stage="session_auto_advance_triggered",
+                            payload={"session_id": session["id"]},
                         )
+                        if started_debug_episode:
+                            self._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
+                        else:
+                            self._play_session_track_with_debug_episode(
+                                session,
+                                selection_strategy="adaptive-session-auto-advance",
+                                debug_reason="adaptive-session-auto-advance",
+                            )
                 except SessionWorkerCancelled:
                     # Cooperative shutdown: exit the loop without logging a
                     # failure. Any in-flight phase already cleared its state.
@@ -584,6 +602,8 @@ class SessionEngine:
                 except Exception as exc:
                     self._host._record_error("worker", "adaptive-session-refill", exc)
                     LOGGER.exception("Adaptive session worker failed during refill loop.")
+                finally:
+                    self._host._end_resolver_debug_episode(started_debug_episode)
         self._worker_thread_ident = None
 
     def _play_session_track_with_debug_episode(
@@ -608,6 +628,8 @@ class SessionEngine:
                 suspended=False,
                 advance_in_progress=True,
                 last_advance_at=self._host.current_timestamp(),
+                pending_stop_track_id=None,
+                pending_stop_observed_at=None,
             )
             self._persist_session_runtime(session["id"], suspended=False, last_advance_at=self._host.current_timestamp())
             try:
@@ -1873,43 +1895,150 @@ class SessionEngine:
         # This coordinates long-lived processes through persisted runtime, but
         # intentionally does not provide an atomic cross-process worker lease.
         runtime = self._effective_session_runtime(session["id"])
+        track = playback.get("track", {})
+        if not isinstance(track, dict):
+            track = {}
+        track_state = self._playback_current_track_state(playback)
+        elapsed = self._seconds_since_runtime_timestamp(runtime.get("last_advance_at"))
+        debug_payload = {
+            "session_id": session["id"],
+            "playback": {
+                "is_playing": playback.get("is_playing"),
+                "track": {
+                    "track_id": _clean_id(track.get("track_id")) or None,
+                    "title": track.get("title"),
+                    "artist": track.get("artist"),
+                    "album": track.get("album"),
+                    "current_playback_time": track.get("current_playback_time"),
+                    "remaining_time": track.get("remaining_time"),
+                    "duration_millis": track.get("duration_millis"),
+                },
+            },
+            "runtime": {
+                "suspended": runtime.get("suspended"),
+                "advance_in_progress": runtime.get("advance_in_progress"),
+                "last_advance_at": runtime.get("last_advance_at"),
+                "last_known_playback_state": runtime.get("last_known_playback_state"),
+                "pending_stop_track_id": runtime.get("pending_stop_track_id"),
+                "pending_stop_observed_at": runtime.get("pending_stop_observed_at"),
+            },
+            "track_state": track_state,
+            "seconds_since_last_advance": elapsed,
+            "cooldown_seconds": self._host.SESSION_ADVANCE_COOLDOWN_SECONDS,
+        }
         if runtime.get("suspended"):
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="session_suspended")
             return False
         if runtime.get("advance_in_progress"):
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="advance_in_progress")
             return False
         is_playing = playback.get("is_playing")
         if is_playing is True:
+            self._clear_pending_stop_confirmation(session["id"])
+            debug_payload["runtime_after_clear"] = self._session_runtime_confirmation_state(session["id"])
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="playback_active")
             return False
         if is_playing is not False:
+            self._clear_pending_stop_confirmation(session["id"])
+            debug_payload["runtime_after_clear"] = self._session_runtime_confirmation_state(session["id"])
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="playback_state_unknown")
             return False
-        if self._playback_has_unfinished_current_track(playback):
+        if track_state == "unfinished":
+            self._clear_pending_stop_confirmation(session["id"])
+            debug_payload["runtime_after_clear"] = self._session_runtime_confirmation_state(session["id"])
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="unfinished_current_track")
             return False
-        elapsed = self._seconds_since_runtime_timestamp(runtime.get("last_advance_at"))
+        if track_state in ("ambiguous", "missing") and not self._confirm_pending_stop_snapshot(session["id"], runtime, playback):
+            debug_payload["runtime_after_confirmation"] = self._session_runtime_confirmation_state(session["id"])
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="awaiting_second_stopped_snapshot")
+            return False
+        if track_state not in ("ambiguous", "missing"):
+            self._clear_pending_stop_confirmation(session["id"])
+            debug_payload["runtime_after_clear"] = self._session_runtime_confirmation_state(session["id"])
         if elapsed is not None and elapsed < self._host.SESSION_ADVANCE_COOLDOWN_SECONDS:
+            self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="advance_cooldown")
             return False
+        debug_payload["runtime_after_confirmation"] = self._session_runtime_confirmation_state(session["id"])
+        self._log_session_auto_advance_decision(debug_payload, advance=True, blocked_by=None)
         return True
 
-    def _playback_has_unfinished_current_track(self, playback: dict[str, Any]) -> bool:
+    def _playback_current_track_state(self, playback: dict[str, Any]) -> str:
         track = playback.get("track", {})
         if not isinstance(track, dict):
-            return False
+            return "missing"
         if not _clean_id(track.get("track_id")):
-            return False
+            return "missing"
         remaining = self._numeric_value(track.get("remaining_time"))
         if remaining is not None and remaining > 1.0:
-            return remaining > 1.0
+            return "unfinished"
         current = self._numeric_value(track.get("current_playback_time"))
         duration = self._numeric_value(track.get("duration_millis"))
         if current is not None and duration is not None and duration > 0:
             duration_seconds = duration / 1000.0 if duration > 1000 else duration
             current_seconds = current / 1000.0 if current > duration_seconds + 5 and current <= duration + 5 else current
-            return current_seconds < duration_seconds - 1.0
+            return "unfinished" if current_seconds < duration_seconds - 1.0 else "finished"
         if remaining is not None:
-            return False
+            return "ambiguous"
         # Cider may briefly report is-playing false while still exposing the
-        # current track during startup/buffering. Treat that as not advanceable
-        # unless timing data proves the track has ended.
-        return True
+        # current track during startup/buffering. Require two consecutive
+        # stopped snapshots before treating that as an advance signal.
+        return "ambiguous"
+
+    def _confirm_pending_stop_snapshot(
+        self,
+        session_id: int,
+        runtime: dict[str, Any],
+        playback: dict[str, Any],
+    ) -> bool:
+        track = playback.get("track", {})
+        track_id = _clean_id(track.get("track_id")) if isinstance(track, dict) else ""
+        if not track_id:
+            # Cider can briefly report a stopped snapshot with an empty
+            # now-playing payload while a track is still playing. Treat the
+            # absence of a track id like any other ambiguous stop and key the
+            # confirmation on a sentinel so two consecutive stopped snapshots are
+            # still required before advancing.
+            track_id = _PENDING_STOP_NO_TRACK_SENTINEL
+        pending_track_id = _clean_id(runtime.get("pending_stop_track_id"))
+        pending_observed_at = runtime.get("pending_stop_observed_at")
+        if pending_track_id == track_id and pending_observed_at is not None:
+            return True
+        self._set_session_runtime(
+            session_id,
+            pending_stop_track_id=track_id,
+            pending_stop_observed_at=self._host.current_timestamp(),
+        )
+        return False
+
+    def _clear_pending_stop_confirmation(self, session_id: int) -> None:
+        runtime = self._get_session_runtime(session_id)
+        if runtime.get("pending_stop_track_id") is None and runtime.get("pending_stop_observed_at") is None:
+            return
+        self._set_session_runtime(session_id, pending_stop_track_id=None, pending_stop_observed_at=None)
+
+    def _session_runtime_confirmation_state(self, session_id: int) -> dict[str, Any]:
+        runtime = self._get_session_runtime(session_id)
+        return {
+            "pending_stop_track_id": runtime.get("pending_stop_track_id"),
+            "pending_stop_observed_at": runtime.get("pending_stop_observed_at"),
+        }
+
+    def _log_session_auto_advance_decision(
+        self,
+        payload: dict[str, Any],
+        *,
+        advance: bool,
+        blocked_by: str | None,
+    ) -> None:
+        decision_payload = dict(payload)
+        decision_payload["decision"] = {
+            "advance": advance,
+            "blocked_by": blocked_by,
+        }
+        self._host.append_session_debug_log(
+            stage="session_auto_advance_evaluated",
+            payload=decision_payload,
+        )
 
     def _numeric_value(self, value: Any) -> float | None:
         if isinstance(value, (int, float)):

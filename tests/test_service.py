@@ -334,7 +334,13 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
     service._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
-    assert service._should_advance_session(session, service.playback_snapshot()) is True
+    playback = service.playback_snapshot()
+
+    # An empty now-playing snapshot is ambiguous: Cider can briefly report no
+    # current track while one is still playing. Require two consecutive stopped
+    # snapshots before treating playback as stopped.
+    assert service._should_advance_session(session, playback) is False
+    assert service._should_advance_session(session, playback) is True
 
     result = service._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
 
@@ -396,6 +402,41 @@ def test_session_worker_can_advance_when_now_playing_track_has_ended(service) ->
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     assert service._should_advance_session(session, service.playback_snapshot()) is True
+
+
+def test_session_worker_requires_two_ambiguous_stopped_snapshots_before_advancing(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    service._rpc.current_track["attributes"]["remainingTime"] = 0
+    service._rpc.current_track["attributes"].pop("currentPlaybackTime", None)
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    playback = service.playback_snapshot()
+
+    assert service._should_advance_session(session, playback) is False
+    assert service._get_session_runtime(session["id"])["pending_stop_track_id"] == "catalog-track-favorite"
+    assert service._should_advance_session(session, playback) is True
+
+
+def test_session_worker_requires_two_missing_track_stopped_snapshots_before_advancing(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    service._rpc.current_track = None
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    playback = service.playback_snapshot()
+
+    assert service._should_advance_session(session, playback) is False
+    assert service._get_session_runtime(session["id"])["pending_stop_track_id"] == "<missing>"
+    assert service._should_advance_session(session, playback) is True
 
 
 def test_active_session_reconcile_tolerates_empty_now_playing_info_list(settings, service) -> None:
@@ -1255,6 +1296,64 @@ def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp
     assert debug_service._resolver.plan_calls == 1
 
 
+def test_auto_advance_debug_log_captures_decision_payload(settings, service, tmp_path) -> None:
+    debug_log_path = tmp_path / "auto-advance-check.log"
+    debug_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        resolver_debug_log_path=debug_log_path,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=settings.session_recent_tracks_limit,
+        global_recent_tracks_limit=settings.global_recent_tracks_limit,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "auto-advance-check.db",
+        config_path=settings.config_path,
+    )
+    debug_service = CiderAgentService(
+        debug_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(debug_settings.database_path),
+        resolver=service._resolver.__class__(),
+    )
+
+    debug_service.play_session("play upbeat music")
+    session = debug_service._preferences.get_active_session()
+    assert session is not None
+
+    debug_service._rpc.is_playing = False
+    debug_service._rpc.current_track["attributes"]["remainingTime"] = 0
+    debug_service._rpc.current_track["attributes"].pop("currentPlaybackTime", None)
+    debug_service._set_session_runtime(session["id"], last_advance_at=0.0)
+    debug_service._preferences.upsert_session_runtime(
+        session["id"], last_advance_at="1970-01-01T00:00:00+00:00"
+    )
+
+    started = debug_service._begin_resolver_debug_episode("adaptive-session-auto-advance-check")
+    try:
+        assert debug_service._should_advance_session(session, debug_service.playback_snapshot()) is False
+    finally:
+        debug_service._end_resolver_debug_episode(started)
+
+    log_text = debug_log_path.read_text(encoding="utf-8")
+    assert "reason: adaptive-session-auto-advance-check" in log_text
+    assert "=== session_auto_advance_evaluated ===" in log_text
+    assert '"blocked_by": "awaiting_second_stopped_snapshot"' in log_text
+    assert '"track_state": "ambiguous"' in log_text
+    assert '"track_id": "catalog-track-favorite"' in log_text
+
+
 def test_preserve_steering_keeps_session_query_pools(service) -> None:
     class CacheFillingResolver:
         def resolve(self, text: str, service) -> ResolvedAction:
@@ -1853,6 +1952,8 @@ def test_active_stopped_session_remains_eligible_after_restart(settings, service
     assert session is not None
     assert restarted._get_session_runtime(session["id"])["suspended"] is False
     assert restarted._preferences.get_session_runtime(session["id"])["active_intent"] == "active"
+    # No current track is ambiguous: confirm across two stopped snapshots.
+    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
     assert restarted._should_advance_session(session, restarted.playback_snapshot()) is True
 
 
