@@ -300,7 +300,7 @@ class OpenAICompatibleResolver:
                 for query in self._normalize_candidate_queries(parsed.get("search_queries"))
             ]
         if not search_sources:
-            synthesized = self._fallback_query_from_text(request)
+            synthesized = request.strip()
             if synthesized:
                 search_sources = [SessionSearchSource(kind="vibe", term=synthesized)]
         search_sources = search_sources[: self.MAX_SESSION_SEARCH_QUERIES]
@@ -762,7 +762,7 @@ class OpenAICompatibleResolver:
                 fallback_queries = normalized.get("candidate_query")
             normalized["candidate_queries"] = self._normalize_candidate_queries(fallback_queries)
             if not normalized["candidate_queries"]:
-                synthesized = self._fallback_query_from_text(original_text)
+                synthesized = original_text.strip()
                 if synthesized:
                     normalized["candidate_queries"] = [synthesized]
             normalized.pop("candidate_query", None)
@@ -829,31 +829,9 @@ class OpenAICompatibleResolver:
         return action, parameters
 
     def _normalize_query_text(self, query: str) -> str:
-        cleaned = query.strip()
-        substitutions = [
-            r"^(popular|top|best|hit)\s+(songs|tracks)\s+by\s+",
-            r"^(songs|tracks|music)\s+by\s+",
-            r"^(play|find|search(?:\s+for)?)\s+",
-            r"^(some|one of)\s+",
-            r"\.\s*one of (his|her|their)\s+more\s+popular\s+songs\.?$",
-            r"\.\s*one of (his|her|their)\s+popular\s+songs\.?$",
-        ]
-        for pattern in substitutions:
-            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-        cleaned = cleaned.strip(" .,:;!?\"'")
-        return cleaned or query.strip()
-
-    def _fallback_query_from_text(self, text: str) -> str:
-        cleaned = self._normalize_query_text(text)
-        lowered = cleaned.casefold()
-        if lowered.startswith("music for "):
-            subject = cleaned[10:].strip()
-            return f"{subject} music".strip() if subject else cleaned
-        if lowered.startswith("music to "):
-            subject = cleaned[9:].strip()
-            subject = re.sub(r"^make me\s+", "", subject, flags=re.IGNORECASE)
-            return f"{subject} music".strip() if subject else cleaned
-        return cleaned
+        # Verbatim semantics: the resolver owns query shaping.  Only trim
+        # surrounding whitespace; do not strip prefixes or rewrite phrasing.
+        return query.strip()
 
     def _normalize_candidate_tracks(self, value: Any) -> list[dict[str, str]]:
         if not isinstance(value, list):

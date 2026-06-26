@@ -161,9 +161,9 @@ It depends on the path.
 
 ### Direct search actions
 
-Direct search methods such as `search_catalog_tracks(query)` and `play_search_result(query=...)` use the provided query string for Apple Music search after light cleanup/validation. These are the closest thing to verbatim search.
+Direct search methods such as `search_catalog_tracks(query)` and `play_search_result(query=...)` use the provided query string for Apple Music search after light validation (whitespace trimming only). These are the closest thing to verbatim search.
 
-The text resolver may normalize phrases before calling those actions. For example, resolver normalization strips leading phrases like `play`, `find`, `search for`, `songs by`, or `popular songs by` from direct search queries.
+The resolver is responsible for query shaping. Resolver-returned search queries, candidate queries, and session sources are used verbatim — Vesper does not strip prefixes like `play`, `find`, `search for`, or `songs by` from resolver output. If the resolver wants a clean search term, it should return one.
 
 ### Adaptive sessions
 

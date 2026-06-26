@@ -323,7 +323,7 @@ def test_openai_compatible_resolver_uses_compact_allowed_action_list(settings: S
     assert "recommend(" not in user_prompt
 
 
-def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Settings, service) -> None:
+def test_openai_compatible_resolver_passes_through_search_query_verbatim(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
         http_port=settings.http_port,
@@ -367,7 +367,7 @@ def test_openai_compatible_resolver_normalizes_descriptive_query(settings: Setti
 
     resolved = resolver.resolve("play some pink", service)
 
-    assert resolved.parameters["query"] == "Pink"
+    assert resolved.parameters["query"] == "popular songs by Pink"
 
 
 def test_openai_compatible_resolver_normalizes_common_action_aliases(settings: Settings, service) -> None:
@@ -897,7 +897,7 @@ def test_candidate_match_parameters_are_normalized(settings: Settings, service) 
 
     assert resolved.action == "play_candidate_match"
     assert "candidate_artists" not in resolved.parameters
-    assert resolved.parameters["candidate_queries"] == ["Pink"]
+    assert resolved.parameters["candidate_queries"] == ["popular songs by Pink"]
 
 
 def test_artist_only_candidate_output_becomes_adaptive_session(settings: Settings, service) -> None:
@@ -1003,7 +1003,7 @@ def test_candidate_match_singular_query_alias_is_normalized(settings: Settings, 
     assert "candidate_query" not in resolved.parameters
 
 
-def test_candidate_match_synthesizes_fallback_query_from_request_text(settings: Settings, service) -> None:
+def test_candidate_match_synthesizes_fallback_query_from_verbatim_request_text(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
         http_port=settings.http_port,
@@ -1050,7 +1050,7 @@ def test_candidate_match_synthesizes_fallback_query_from_request_text(settings: 
     resolved = resolver.resolve("play music for bedtime", service)
 
     assert resolved.action == "play_candidate_match"
-    assert resolved.parameters["candidate_queries"] == ["bedtime music"]
+    assert resolved.parameters["candidate_queries"] == ["play music for bedtime"]
 
 
 def test_openai_compatible_resolver_includes_raw_output_when_enabled(settings: Settings, service) -> None:
