@@ -2003,18 +2003,21 @@ class SessionEngine:
         pending_observed_at = runtime.get("pending_stop_observed_at")
         if pending_track_id == track_id and pending_observed_at is not None:
             return True
+        observed_at = self._host.current_timestamp()
         self._set_session_runtime(
             session_id,
             pending_stop_track_id=track_id,
-            pending_stop_observed_at=self._host.current_timestamp(),
+            pending_stop_observed_at=observed_at,
         )
+        self._preferences.update_session_pending_stop(session_id, track_id=track_id, observed_at=observed_at)
         return False
 
     def _clear_pending_stop_confirmation(self, session_id: int) -> None:
-        runtime = self._get_session_runtime(session_id)
+        runtime = self._effective_session_runtime(session_id)
         if runtime.get("pending_stop_track_id") is None and runtime.get("pending_stop_observed_at") is None:
             return
         self._set_session_runtime(session_id, pending_stop_track_id=None, pending_stop_observed_at=None)
+        self._preferences.update_session_pending_stop(session_id, track_id=None, observed_at=None)
 
     def _session_runtime_confirmation_state(self, session_id: int) -> dict[str, Any]:
         runtime = self._get_session_runtime(session_id)
@@ -2066,6 +2069,12 @@ class SessionEngine:
             runtime["last_selected_track_id"] = stored.get("last_selected_track_id")
         if "last_known_playback_state" not in runtime and stored.get("last_known_playback_state") is not None:
             runtime["last_known_playback_state"] = stored.get("last_known_playback_state")
+        # The two-snapshot stop confirmation is cross-process state: a stop
+        # observed by one process must count toward confirmation in another.
+        # Persisted values are authoritative, including None once cleared.
+        if stored:
+            runtime["pending_stop_track_id"] = stored.get("pending_stop_track_id")
+            runtime["pending_stop_observed_at"] = stored.get("pending_stop_observed_at")
         return runtime
 
     def _get_session_runtime(self, session_id: int) -> dict[str, Any]:

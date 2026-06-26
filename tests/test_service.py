@@ -439,6 +439,95 @@ def test_session_worker_requires_two_missing_track_stopped_snapshots_before_adva
     assert service._should_advance_session(session, playback) is True
 
 
+def test_pending_stop_confirmation_persists_across_process_restart(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "cross-process-pending-stop.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    session = first._preferences.get_active_session()
+    assert session is not None
+
+    rpc.is_playing = False
+    rpc.current_track = None
+    first._set_session_runtime(session["id"], last_advance_at=0.0)
+    first._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    # The first process observes one stopped snapshot: it arms and PERSISTS the
+    # pending confirmation, so it must not advance yet.
+    assert first._should_advance_session(session, first.playback_snapshot()) is False
+    assert first._preferences.get_session_runtime(session["id"])["pending_stop_track_id"] == "<missing>"
+
+    # A fresh process on the same database must observe the armed confirmation
+    # and confirm on its very first stopped snapshot instead of re-arming.
+    second = CiderAgentService(
+        first._settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
+    restarted_session = second._preferences.get_active_session()
+    assert restarted_session is not None
+    assert second._should_advance_session(restarted_session, second.playback_snapshot()) is True
+
+
+def test_preference_store_backfills_pending_stop_columns(tmp_path) -> None:
+    import sqlite3
+
+    database_path = tmp_path / "legacy-runtime.db"
+    # Simulate a database written by a pre-migration version: the runtime table
+    # exists but lacks the pending_stop confirmation columns.
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE session_runtime (
+                session_id INTEGER PRIMARY KEY,
+                active_intent TEXT NOT NULL DEFAULT 'active',
+                last_advance_at TEXT,
+                last_selected_track_id TEXT,
+                last_known_playback_state TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("INSERT INTO session_runtime (session_id) VALUES (1)")
+
+    # Instantiating the store runs the schema migration.
+    store = PreferenceStore(database_path)
+    runtime = store.get_session_runtime(1)
+    assert runtime is not None
+    assert runtime["pending_stop_track_id"] is None
+    assert runtime["pending_stop_observed_at"] is None
+
+    store.update_session_pending_stop(1, track_id="<missing>", observed_at="2026-01-01T00:00:00+00:00")
+    assert store.get_session_runtime(1)["pending_stop_track_id"] == "<missing>"
+
+
 def test_active_session_reconcile_tolerates_empty_now_playing_info_list(settings, service) -> None:
     service._preferences.start_session(request_text="play upbeat music")
 

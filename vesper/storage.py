@@ -128,11 +128,14 @@ class PreferenceStore:
                     last_advance_at TEXT,
                     last_selected_track_id TEXT,
                     last_known_playback_state TEXT,
+                    pending_stop_track_id TEXT,
+                    pending_stop_observed_at TEXT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 )
                 """
             )
+            self._ensure_session_runtime_columns(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS session_events (
@@ -190,6 +193,16 @@ class PreferenceStore:
                 ON session_queue_items(session_id, track_id)
                 """
             )
+
+    def _ensure_session_runtime_columns(self, connection: sqlite3.Connection) -> None:
+        # ``ALTER TABLE ... ADD COLUMN`` has no ``IF NOT EXISTS`` in SQLite, so
+        # backfill the pending-stop confirmation columns for databases created
+        # before they existed. New databases get them from CREATE TABLE above.
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(session_runtime)")}
+        if "pending_stop_track_id" not in existing:
+            connection.execute("ALTER TABLE session_runtime ADD COLUMN pending_stop_track_id TEXT")
+        if "pending_stop_observed_at" not in existing:
+            connection.execute("ALTER TABLE session_runtime ADD COLUMN pending_stop_observed_at TEXT")
 
     def list_preferences(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -942,7 +955,7 @@ class PreferenceStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT session_id, active_intent, last_advance_at, last_selected_track_id, last_known_playback_state, updated_at
+                SELECT session_id, active_intent, last_advance_at, last_selected_track_id, last_known_playback_state, pending_stop_track_id, pending_stop_observed_at, updated_at
                 FROM session_runtime
                 WHERE session_id = ?
                 """,
@@ -956,6 +969,8 @@ class PreferenceStore:
             "last_advance_at": row["last_advance_at"],
             "last_selected_track_id": row["last_selected_track_id"],
             "last_known_playback_state": row["last_known_playback_state"],
+            "pending_stop_track_id": row["pending_stop_track_id"],
+            "pending_stop_observed_at": row["pending_stop_observed_at"],
             "updated_at": row["updated_at"],
         }
 
@@ -1016,6 +1031,31 @@ class PreferenceStore:
         if runtime is None:
             raise PreferenceStoreError(f"Session runtime for session {session_id} was not found after update.")
         return runtime
+
+    def update_session_pending_stop(
+        self,
+        session_id: int,
+        *,
+        track_id: str | None,
+        observed_at: str | None,
+    ) -> None:
+        """Persist (or clear, when both are ``None``) the two-snapshot stop
+        confirmation so it survives a process restart. A focused UPDATE: it
+        touches only these columns and is a no-op when no runtime row exists,
+        which is fine because a stop is only ever evaluated for an active,
+        already-persisted session."""
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE session_runtime
+                    SET pending_stop_track_id = ?, pending_stop_observed_at = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE session_id = ?
+                    """,
+                    (track_id, observed_at, session_id),
+                )
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not update session pending stop: {exc}") from exc
 
     def clear_session_runtime(self, session_id: int) -> None:
         try:
