@@ -233,6 +233,15 @@ vesper session queue --json
 vesper session queue --all --limit 100 --json
 ```
 
+To inspect the in-memory candidate pools that feed queue materialization:
+
+```sh
+vesper session candidates --json
+vesper session candidates --window 5 --json
+```
+
+Candidate pools are process-local runtime state and are empty after a process restart, even if a session is persisted.
+
 This means: `get_queue` is not the same as “show me every future Vesper session item.” Vesper usually plays selected tracks directly rather than enqueueing the whole session queue into Cider.
 
 ## What Happens After a Session Starts?

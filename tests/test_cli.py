@@ -59,6 +59,26 @@ def test_cli_session_queue_calls_service(monkeypatch, capsys) -> None:
     assert payload["items"][0]["title"] == "Queued"
 
 
+def test_cli_session_candidates_calls_service(monkeypatch, capsys) -> None:
+    class FakeService:
+        def session_candidates(self, *, window: int):
+            return {
+                "status": "ok",
+                "window": window,
+                "pools": [{"source": {"kind": "artist", "term": "Pink"}, "cursor": 0}],
+            }
+
+    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+    monkeypatch.setattr("sys.argv", ["vesper", "--json", "session", "candidates", "--window", "5"])
+
+    cli.main()
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["window"] == 5
+    assert payload["pools"][0]["source"]["term"] == "Pink"
+
+
 def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
     class FakeService:
         def handle_text_request(self, text: str):

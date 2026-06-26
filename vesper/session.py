@@ -312,6 +312,67 @@ class SessionEngine:
             "items": items,
         }
 
+    def session_candidates(self, *, window: int = 10) -> dict[str, Any]:
+        """Inspect the active session's in-memory candidate pools.
+
+        This is a read-only developer/debug view of the adaptive-session
+        candidate pools.  It is distinct from Cider's native playback queue
+        and from the persisted session queue shown by ``session_queue``.
+
+        Candidate pools are process-local runtime state.  After a process
+        restart the pools are empty even if a session is persisted.
+        """
+        session = self._preferences.get_active_session()
+        if session is None:
+            return {"status": "ok", "session": None, "pools": []}
+        session_id = int(session["id"])
+        runtime = self._get_session_runtime(session_id)
+        active_sources = self._normalize_search_sources(runtime.get("active_search_sources"))
+        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+        pool_payloads: list[dict[str, Any]] = []
+        for source_key, pool in pools.items():
+            entries = pool.get("entries", [])
+            state_counts: dict[str, int] = {"fresh": 0, "played": 0, "screened_out": 0, "rejected": 0}
+            fresh_entries: list[dict[str, Any]] = []
+            for index, entry in enumerate(entries):
+                state = entry.get("state", "fresh")
+                if state in state_counts:
+                    state_counts[state] += 1
+                else:
+                    state_counts[state] = 1
+                if state == "fresh" and len(fresh_entries) < window:
+                    track = entry.get("track") or {}
+                    fresh_entries.append({
+                        "index": index,
+                        "title": track.get("title"),
+                        "artist": track.get("artist"),
+                        "album": track.get("album"),
+                        "id": _clean_id(track.get("id")) or _clean_id(track.get("play_params", {}).get("id")),
+                        "source": pool.get("source"),
+                    })
+            cursor = pool.get("cursor", 0)
+            if not isinstance(cursor, int):
+                cursor = 0
+            pool_payloads.append({
+                "source_key": source_key,
+                "source": pool.get("source"),
+                "search_query": pool.get("search_query"),
+                "cursor": cursor,
+                "total_entries": len(entries),
+                "state_counts": state_counts,
+                "next_window": fresh_entries,
+            })
+        return {
+            "status": "ok",
+            "session": {
+                "id": session["id"],
+                "request_text": session.get("request_text"),
+                "mode": session.get("mode"),
+            },
+            "active_search_sources": self._host._sources_payload(active_sources),
+            "pools": pool_payloads,
+        }
+
     def recent_session_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         session = self._preferences.get_active_session()
         if session is None:

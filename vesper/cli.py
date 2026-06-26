@@ -39,6 +39,8 @@ def _build_parser() -> argparse.ArgumentParser:
     session_queue = session_subparsers.add_parser("queue")
     session_queue.add_argument("--limit", type=int, default=50)
     session_queue.add_argument("--all", action="store_true", help="Include played, rejected, and filtered queue history.")
+    session_candidates = session_subparsers.add_parser("candidates")
+    session_candidates.add_argument("--window", type=int, default=10, help="Number of fresh candidate entries to show per pool.")
 
     preferences = subparsers.add_parser("preferences")
     preferences_subparsers = preferences.add_subparsers(dest="preferences_command", required=True)
@@ -93,6 +95,8 @@ def main() -> None:
             elif args.command == "session":
                 if args.session_command == "queue":
                     payload = service.session_queue(limit=args.limit, include_history=args.all)
+                elif args.session_command == "candidates":
+                    payload = service.session_candidates(window=args.window)
                 else:  # pragma: no cover - argparse enforces commands
                     raise RuntimeError(f"Unhandled session command: {args.session_command}")
             elif args.command == "preferences":

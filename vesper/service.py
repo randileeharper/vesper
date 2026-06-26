@@ -1158,6 +1158,9 @@ class CiderAgentService:
     def session_queue(self, *, limit: int = 50, include_history: bool = False) -> dict[str, Any]:
         return self._session.session_queue(limit=limit, include_history=include_history)
 
+    def session_candidates(self, *, window: int = 10) -> dict[str, Any]:
+        return self._session.session_candidates(window=window)
+
     def recent_session_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         return self._session.recent_session_tracks(limit=limit)
 
