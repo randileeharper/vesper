@@ -715,6 +715,57 @@ def test_preference_seeded_session_falls_back_to_direct_liked_track_when_search_
     assert result["result"]["tracks"][0]["title"] == "Liked Song"
 
 
+def test_session_candidates_returns_none_when_no_active_session(service) -> None:
+    result = service.session_candidates()
+
+    assert result["status"] == "ok"
+    assert result["session"] is None
+    assert result["pools"] == []
+
+
+def test_session_candidates_reports_active_session_pools(service) -> None:
+    service.play_session("play something upbeat")
+
+    result = service.session_candidates()
+
+    assert result["status"] == "ok"
+    assert result["session"]["request_text"] == "play something upbeat"
+    assert isinstance(result["active_search_sources"], list)
+    assert len(result["active_search_sources"]) >= 1
+    pools = result["pools"]
+    assert len(pools) >= 1
+    pool = pools[0]
+    assert "source" in pool
+    assert "cursor" in pool
+    assert "total_entries" in pool
+    assert "state_counts" in pool
+    assert "next_window" in pool
+    state_counts = pool["state_counts"]
+    assert set(state_counts.keys()) >= {"fresh", "played", "screened_out", "rejected"}
+    # After session start, one track has been claimed/played, the rest are fresh.
+    assert state_counts["fresh"] >= 1 or pool["total_entries"] >= 1
+
+
+def test_session_candidates_respects_window_limit(service) -> None:
+    service.play_session("play something upbeat")
+
+    result = service.session_candidates(window=2)
+
+    pool = result["pools"][0]
+    assert len(pool["next_window"]) <= 2
+
+
+def test_session_candidates_empty_pools_after_runtime_cleared(service) -> None:
+    service.play_session("play something upbeat")
+    service._session._clear_all_session_runtime()
+
+    result = service.session_candidates()
+
+    # Session is still persisted, but runtime pools are gone.
+    assert result["session"] is not None
+    assert result["pools"] == []
+
+
 def test_global_rejects_are_excluded_from_new_session_caches(service) -> None:
     service._preferences.record_global_rejected_track(
         track_id="catalog-track-favorite",

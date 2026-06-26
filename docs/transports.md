@@ -18,6 +18,7 @@ vesper preferences list
 vesper preferences forget 12
 vesper session queue --json
 vesper session queue --all --limit 100 --json
+vesper session candidates --json
 ```
 
 Use `--json` to print the full payload instead of the default result-focused view:
@@ -29,6 +30,8 @@ vesper --json ask "play some music"
 CLI commands call the service directly in the current process. They do not require `vesper serve` to be running.
 
 `vesper session queue` inspects Vesper's persisted adaptive-session queue, not Cider's native playback queue. By default it shows queued/playing rows; `--all` includes played, rejected, and filtered history.
+
+`vesper session candidates` inspects the active session's in-memory candidate pools — the runtime pools Vesper builds from Apple Music search results before materializing them into the persisted queue. This is a read-only developer/debug view. It reports active search sources, per-pool cursor and candidate counts by state (`fresh`, `played`, `screened_out`, `rejected`), and a next-candidate window of fresh entries. Use `--window N` to control how many fresh entries are shown per pool. Candidate pools are process-local runtime state; after a process restart the pools are empty even if a session is persisted.
 
 ## HTTP Serving
 
