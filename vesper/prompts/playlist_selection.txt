@@ -1,0 +1,3 @@
+Choose the Apple Music playlist that best matches this adaptive session vibe.
+Return only JSON with shape {"selected_index": number}.
+Use -1 when none of the playlists fit.

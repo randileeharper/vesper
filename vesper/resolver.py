@@ -12,6 +12,7 @@ import httpx
 from .action_registry import list_resolver_action_definitions
 from .config import Settings
 from .errors import ResolverError
+from .prompts import load_prompt
 
 
 @dataclass
@@ -406,26 +407,7 @@ class OpenAICompatibleResolver:
             "active_session": active_session,
             "allowed_actions": self._resolver_action_specs(),
         }
-        system = (
-            "You are the Vesper request resolver. "
-            "Return exactly one JSON object with keys action and parameters. "
-            "Use only an action from allowed_actions. "
-            "Do not explain anything. "
-            "Use the bare action name only, for example next_track not next_track(). "
-            "Do not use markdown, code fences, comments, or prose. "
-            "Use play_session for descriptive music requests, vibe requests, activity requests, or artist-only requests. "
-            "Use list_library_playlists when the user asks what playlists are available or to list playlists. "
-            "Use play_library_playlist when the user asks to play a specific playlist by name. "
-            "Use like_current_track when the user says they like the current song or track. "
-            "Use steer_session only when there is already an active session and the user wants to shape future picks. "
-            "Use reject_current_track when the user dislikes only the current song and wants a new one now. "
-            "When the user asks for vague playback like 'play some music', still use play_session. "
-            "Use play_search_result or play_candidate_match only for specific song requests. "
-            "For play_session and steer_session, always use parameters.request. "
-            "For steer_session search_update, use {mode, sources}; each source has kind artist, genre, or vibe and term. "
-            "Keep request text short and concrete. "
-            "Do not invent songs, artists, or albums."
-        )
+        system = load_prompt("resolver")
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nRequest:\n{text}"},
@@ -441,29 +423,7 @@ class OpenAICompatibleResolver:
             "rejected_sources": service.session_rejected_search_sources(session),
             "count": count,
         }
-        system = (
-            "You are planning the next typed source for an adaptive music session in Vesper. "
-            "Return only JSON with key search_sources, containing objects with kind and term. "
-            "You may also return queue_policy as source_order or shuffle. "
-            f"The session needs {count} source right now; return exactly 1 source when possible. "
-            "Allowed kinds are artist, genre, vibe, and preference. "
-            "Use artist for artist names, including artist-plus-mood requests; put only the artist name in term. "
-            "Use genre only when term exactly matches one of supported_genres. "
-            "Use vibe for genre-plus-mood/activity, unsupported subgenres, and descriptive requests. "
-            "Use preference for extremely vague requests where saved preferences should seed playback. "
-            "If supported_genres is empty, never use genre. "
-            "Never repeat a source listed in rejected_sources; choose a materially different source. "
-            "Honor the original session_request, steering changes, and the current timestamp. "
-            "Treat session_steering as persistent cumulative session state, not a one-turn hint. "
-            "Negative steering must continue to apply to future selections until explicitly overridden. "
-            "Positive steering must continue to shape future selections until explicitly overridden. "
-            "If the session request is extremely vague, the service may already seed playback from saved preferences; do not force a made-up micro-vibe in that case. "
-            "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
-            "If the user already asked for a specific genre, artist, era, or other concrete music descriptor, preserve that request broadly instead of narrowing it to a more specific sub-vibe, mood, or subset unless the user explicitly asked for that narrowing. "
-            "For example, a request like 'play trip-hop' should stay broad and should not be rewritten into a narrower variant like 'atmospheric trip hop' unless the user asked for atmospheric music. "
-            "Use more creative interpretation only when the request is open-ended, contextual, or activity-based, such as cleaning, studying, waking up, winding down, or hosting people. "
-            "Do not guess final tracks from memory here; choose the best typed Apple Music retrieval source."
-        )
+        system = load_prompt("session_planner").format(count=count)
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nPlan the next search query for this session."},
@@ -484,11 +444,7 @@ class OpenAICompatibleResolver:
             "search_source": {"kind": search_source.kind, "term": search_source.term},
             "candidates": candidates[:5],
         }
-        system = (
-            "Choose the Apple Music playlist that best matches this adaptive session vibe. "
-            "Return only JSON with shape {\"selected_index\": number}. "
-            "Use -1 when none of the playlists fit."
-        )
+        system = load_prompt("playlist_selection")
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nChoose a playlist."},
@@ -507,13 +463,7 @@ class OpenAICompatibleResolver:
             "failed_vibe_term": search_source.term,
             "attempted_terms": attempted_terms,
         }
-        system = (
-            "Rewrite a failed Apple Music playlist search term for an adaptive music-session vibe. "
-            "Return only JSON with shape {\"term\": string}. "
-            "Use a short, broader phrase suitable for playlist search. "
-            "Do not repeat any attempted_terms. "
-            "Preserve the user's core mood, activity, genre, or era."
-        )
+        system = load_prompt("vibe_rephrase")
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nReturn a new term."},
@@ -554,13 +504,7 @@ class OpenAICompatibleResolver:
                 for candidate in candidates[:20]
             ],
         }
-        system = (
-            "Filter a batch of remaining queued tracks for an adaptive music session after steering. "
-            "Return only JSON with shape {\"eligible_indices\": [number], \"queue_policy\": \"source_order\"}. "
-            "Use eligible_indices to keep candidates that still fit the session request and steering. "
-            "Use queue_policy source_order by default, or shuffle only when the user asks for variety/randomness. "
-            "Indices are zero-based within the shown candidates."
-        )
+        system = load_prompt("session_queue_filter")
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nFilter this queue batch."},

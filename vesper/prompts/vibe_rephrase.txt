@@ -1,0 +1,5 @@
+Rewrite a failed Apple Music playlist search term for an adaptive music-session vibe.
+Return only JSON with shape {"term": string}.
+Use a short, broader phrase suitable for playlist search.
+Do not repeat any attempted_terms.
+Preserve the user's core mood, activity, genre, or era.
