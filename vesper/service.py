@@ -53,7 +53,7 @@ from .resolver import (
     build_resolver,
 )
 from .rpc import CiderRpcClient
-from .storage import PreferenceStore
+from .storage import PreferenceStore, close_connections
 from .output import (
     compact_output,
     compact_resolved_action,
@@ -162,6 +162,9 @@ class CiderAgentService:
         if callable(close):
             close()
         self._historian.close()
+        # Release cached SQLite connections now that the background worker (the
+        # only other thread that could touch the DB) has stopped. See #50.
+        close_connections(self._settings.database_path)
 
     @property
     def _session_worker_thread(self):

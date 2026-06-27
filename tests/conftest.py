@@ -14,7 +14,7 @@ from vesper.config import Settings
 from vesper.rpc import CiderRpcClient
 from vesper.resolver import ResolvedAction, SessionQueryPlan, SessionSearchSource
 from vesper.service import CiderAgentService
-from vesper.storage import PreferenceStore
+from vesper.storage import PreferenceStore, close_connections
 
 
 class FakeResponse:
@@ -409,3 +409,16 @@ def service(settings: Settings) -> CiderAgentService:
 def rpc_client(settings: Settings):
     session = FakeSession(lambda method, path, headers, body: FakeResponse(200, {"ok": True}))
     return CiderRpcClient(settings, session=session), session
+
+
+@pytest.fixture(autouse=True)
+def _close_storage_connections() -> Any:
+    """Release cached SQLite connections after each test.
+
+    Each test uses a fresh ``tmp_path`` database. The thread-local connection
+    cache (issue #50) would otherwise hold a connection to the stale file
+    across tests, leaking file handles. Tearing connections down here keeps the
+    cache per-test.
+    """
+    yield
+    close_connections()

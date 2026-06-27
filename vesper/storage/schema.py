@@ -3,14 +3,82 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
+from typing import Dict, Tuple
+
+
+# SQLite connections are opened with ``check_same_thread=False`` so that
+# :func:`close_connections` can release a connection from a different thread
+# (e.g. the main thread closing a background worker's connection after the
+# worker has stopped). Concurrency safety comes from the per-operation ``with``
+# blocks that serialize transactions on a given connection, plus SQLite's own
+# WAL locking. A thread-local cache keyed by the resolved database path gives
+# every thread one long-lived connection per database file. This replaces the
+# previous "open a new connection per operation" behavior (issue #50), which
+# churned through connections, leaked them (the ``with`` only managed the
+# transaction, never closing the handle), and contended on SQLite's file-level
+# locks between the background session worker and request handlers.
+_connections: Dict[Tuple[int, str], sqlite3.Connection] = {}
+_connections_guard = threading.Lock()
+
+
+def _cache_key(database_path: Path) -> Tuple[int, str]:
+    return (threading.get_ident(), str(Path(database_path).resolve()))
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
-    """Open a SQLite connection with row access by column name."""
-    connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
-    return connection
+    """Return a cached, thread-local SQLite connection with row access by name.
+
+    Each ``(thread, database file)`` pair gets one persistent connection. The
+    connection is configured for WAL mode (``journal_mode=wal``) and
+    ``synchronous=NORMAL`` for better read/write concurrency. Callers that wrap
+    this in a ``with`` statement drive per-operation commit/rollback exactly as
+    before; the connection itself simply survives across operations.
+    """
+    key = _cache_key(database_path)
+    # Fast path: the common case once a thread has warmed its connection.
+    connection = _connections.get(key)
+    if connection is not None:
+        return connection
+
+    with _connections_guard:
+        # Re-check under the lock in case another thread created one for a key
+        # that happens to hash identically (it cannot be the same thread here,
+        # since the key embeds the thread id, but the dict write must be guarded).
+        connection = _connections.get(key)
+        if connection is not None:
+            return connection
+
+        connection = sqlite3.connect(database_path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        # WAL allows concurrent readers alongside a single writer; NORMAL is
+        # safe under WAL and avoids an fsync per commit, which is the right
+        # tradeoff for a local application store.
+        connection.execute("PRAGMA journal_mode=wal")
+        connection.execute("PRAGMA synchronous=normal")
+        _connections[key] = connection
+        return connection
+
+
+def close_connections(database_path: Path | None = None) -> None:
+    """Close cached connections, optionally scoped to one database file.
+
+    With *database_path*, closes only connections to that file (across all
+    threads). Without it, closes every cached connection. Safe to call from any
+    thread. Used by :meth:`vesper.service.CiderAgentService.close` and by test
+    fixtures to release per-test databases.
+    """
+    with _connections_guard:
+        if database_path is None:
+            keys = list(_connections.keys())
+        else:
+            resolved = str(Path(database_path).resolve())
+            keys = [key for key in _connections if key[1] == resolved]
+        for key in keys:
+            connection = _connections.pop(key, None)
+            if connection is not None:
+                connection.close()
 
 
 def initialize(database_path: Path) -> None:

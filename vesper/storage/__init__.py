@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import preferences, schema, session_data, session_queue, sessions
+from .schema import close_connections
 
 
 class PreferenceStore:
@@ -260,4 +261,4 @@ class PreferenceStore:
         )
 
 
-__all__ = ["PreferenceStore"]
+__all__ = ["PreferenceStore", "close_connections"]
