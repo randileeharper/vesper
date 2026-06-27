@@ -4,6 +4,7 @@ from pathlib import Path
 
 import anyio
 import httpx
+import pytest
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -221,5 +222,50 @@ def test_mounted_mcp_requests_do_not_stop_parent_session_worker(monkeypatch, tmp
 
             assert service._session_worker_thread is worker
             assert worker.is_alive()
+
+    anyio.run(_exercise)
+
+
+@pytest.mark.parametrize("include_a2a, include_mcp", [(True, False), (False, True), (True, True)])
+def test_worker_does_not_run_after_http_lifespan_shutdown(monkeypatch, tmp_path: Path, include_a2a: bool, include_mcp: bool) -> None:
+    """The worker must be stopped once the HTTP app lifespan exits (#45).
+
+    All three HTTP transport combinations delegate worker start/stop to the
+    single Application.worker_lifespan, so the worker must not be alive after
+    the lifespan context closes.
+    """
+    settings, service = _make_service(tmp_path)
+    monkeypatch.setattr(a2a, "get_settings", lambda: settings)
+    monkeypatch.setattr(a2a, "get_service", lambda: service)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_server, "get_service", lambda: service)
+
+    app = create_http_app(include_a2a=include_a2a, include_mcp=include_mcp)
+
+    async def _exercise() -> None:
+        async with app.router.lifespan_context(app):
+            assert service._session_worker_thread is not None
+            assert service._session_worker_thread.is_alive()
+        # After the lifespan exits, the worker must have been stopped.
+        assert service._session_worker_thread is None
+
+    anyio.run(_exercise)
+
+
+def test_worker_does_not_run_after_standalone_mcp_lifespan_shutdown(monkeypatch, tmp_path: Path) -> None:
+    """Standalone MCP (e.g. stdio) must stop the worker on lifespan exit (#45)."""
+    settings, service = _make_service(tmp_path)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_server, "get_service", lambda: service)
+
+    server = mcp_server.create_mcp_server()
+
+    async def _exercise() -> None:
+        async with create_connected_server_and_client_session(server) as session:
+            await session.list_tools()
+            assert service._session_worker_thread is not None
+            assert service._session_worker_thread.is_alive()
+        # After the standalone MCP session closes, the worker must have stopped.
+        assert service._session_worker_thread is None
 
     anyio.run(_exercise)

@@ -7,25 +7,24 @@ from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
-from .app import get_service, get_settings
+from .app import Application, get_service, get_settings
 from .errors import CiderValidationError
 
 
 @asynccontextmanager
 async def _mcp_lifespan(_: FastMCP):
-    service = get_service()
-    service.start_background_session_worker()
-    try:
+    # Standalone MCP (e.g. stdio) owns the worker via the single lifecycle
+    # source in Application (see #45).
+    async with Application(get_service()).worker_lifespan():
         yield
-    finally:
-        service.stop_background_session_worker()
 
 
 @asynccontextmanager
 async def _embedded_mcp_lifespan(_: FastMCP):
-    # The parent HTTP app owns the shared session worker. FastMCP invokes its
-    # lifespan for stateless request sessions, so stopping the worker here
-    # would disable adaptive-session auto-advance after every MCP request.
+    # When mounted under the parent HTTP app, that app's lifespan owns the
+    # worker via Application.worker_lifespan. FastMCP invokes its lifespan for
+    # each stateless request session, so stopping the worker here would
+    # disable adaptive-session auto-advance after every MCP request.
     yield
 
 

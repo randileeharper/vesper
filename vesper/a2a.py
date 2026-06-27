@@ -40,7 +40,7 @@ from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, PROTOCOL_VERSION_1_0
 from a2a.utils.errors import InternalError, InvalidParamsError
 
 from .action_registry import is_public_action
-from .app import get_service, get_settings
+from .app import Application, get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
 from .mcp_server import create_mcp_server
 from .renderers import render_action_result_for_a2a, render_text_result_for_a2a
@@ -390,15 +390,14 @@ class CiderAgentExecutor(AgentExecutor):
 def _create_lifespan(mcp_session_manager=None):
     @asynccontextmanager
     async def _lifespan(_: FastAPI):
-        service = get_service()
-        service.start_background_session_worker()
-        try:
-            async with AsyncExitStack() as stack:
-                if mcp_session_manager is not None:
-                    await stack.enter_async_context(mcp_session_manager.run())
-                yield
-        finally:
-            service.stop_background_session_worker()
+        # The worker lifecycle has a single owner: Application.worker_lifespan
+        # (see #45). Transports compose it instead of calling the service
+        # start/stop methods directly.
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(Application(get_service()).worker_lifespan())
+            if mcp_session_manager is not None:
+                await stack.enter_async_context(mcp_session_manager.run())
+            yield
 
     return _lifespan
 
