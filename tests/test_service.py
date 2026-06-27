@@ -436,6 +436,34 @@ def test_session_worker_requires_two_missing_track_stopped_snapshots_before_adva
     assert service._should_advance_session(session, playback) is True
 
 
+def test_session_runtime_timestamps_are_utc_wall_clock_not_monotonic(service) -> None:
+    # Issue #48: persisted session-runtime timestamps must be wall-clock UTC
+    # ISO-8601, never time.monotonic() floats, so they stay valid across
+    # processes and after restarts.
+    from datetime import UTC, datetime
+
+    ts = service.current_timestamp()
+    parsed = datetime.fromisoformat(ts)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset().total_seconds() == 0
+    assert ts.endswith("+00:00")
+
+    # Numeric / monotonic values are rejected outright (no monotonic branch).
+    engine = service._session
+    assert engine._seconds_since_runtime_timestamp(0.0) is None
+    assert engine._seconds_since_runtime_timestamp(None) is None
+
+    # A persisted UTC string from the recent past yields a non-negative,
+    # timezone-correct elapsed delta rather than a monotonic difference.
+    recent = (datetime.now(UTC).isoformat(timespec="seconds"))
+    elapsed = engine._seconds_since_runtime_timestamp(recent)
+    assert elapsed is not None and elapsed >= 0.0
+
+    # A far-past UTC timestamp reports a large elapsed span (cooldown bypassed).
+    old = engine._seconds_since_runtime_timestamp("1970-01-01T00:00:00+00:00")
+    assert old is not None and old > service.SESSION_ADVANCE_COOLDOWN_SECONDS
+
+
 def test_pending_stop_confirmation_persists_across_process_restart(settings, service, tmp_path) -> None:
     database_path = tmp_path / "cross-process-pending-stop.db"
     rpc = service._rpc.__class__()

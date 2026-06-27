@@ -179,10 +179,14 @@ def initialize(database_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS session_runtime (
                 session_id INTEGER PRIMARY KEY,
                 active_intent TEXT NOT NULL DEFAULT 'active',
+                -- Wall-clock UTC ISO-8601 (e.g. 2026-06-27T12:00:00+00:00).
+                -- Never store time.monotonic() here: monotonic time is
+                -- process-local and invalid across restarts / other processes.
                 last_advance_at TEXT,
                 last_selected_track_id TEXT,
                 last_known_playback_state TEXT,
                 pending_stop_track_id TEXT,
+                -- Same UTC ISO-8601 wall-clock format as last_advance_at.
                 pending_stop_observed_at TEXT,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)

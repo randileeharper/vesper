@@ -14,8 +14,7 @@ methods did before extraction. Cross-mixin calls (e.g.
 
 from __future__ import annotations
 
-import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .utils import _clean_id
@@ -369,17 +368,22 @@ class SessionRuntimeMixin:
         )
 
     def _seconds_since_runtime_timestamp(self, value: Any) -> float | None:
-        if value is None:
+        # Persisted session-runtime timestamps are wall-clock UTC ISO-8601
+        # strings produced by ``SessionHost.current_timestamp``. They must be
+        # comparable across processes and after restarts, so numeric
+        # ``time.monotonic()`` values are intentionally rejected: monotonic
+        # time is process-local and meaningless once persisted or read back by
+        # another process. Non-string values (including floats) yield ``None``
+        # rather than being treated as monotonic.
+        if not isinstance(value, str):
             return None
-        if isinstance(value, (int, float)):
-            return time.monotonic() - float(value)
-        if isinstance(value, str):
-            try:
-                then = datetime.fromisoformat(value)
-            except ValueError:
-                return None
-            return (datetime.now().astimezone() - then.astimezone()).total_seconds()
-        return None
+        try:
+            then = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - then).total_seconds()
 
     def _record_session_selection_event(self, session_id: int, track: dict[str, Any], *, selection_strategy: str) -> None:
         event_type = "track_selected"

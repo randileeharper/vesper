@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import wraps
 import logging
 import json
@@ -321,7 +321,11 @@ class CiderAgentService:
         return self._settings.global_recent_tracks_limit
 
     def current_timestamp(self) -> str:
-        return datetime.now().astimezone().isoformat(timespec="seconds")
+        # Wall-clock UTC ISO-8601. Persisted session-runtime timestamps
+        # (last_advance_at, pending_stop_observed_at) must be comparable across
+        # processes and after restarts, so they may never be time.monotonic()
+        # values; a single UTC source of truth keeps every consumer consistent.
+        return datetime.now(UTC).isoformat(timespec="seconds")
 
     def list_action_definitions(self, *, text_exposable_only: bool = False, public_only: bool = True) -> list[dict[str, Any]]:
         definitions_source = (
