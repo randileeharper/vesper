@@ -8,7 +8,6 @@ import logging
 import json
 import random
 import threading
-import time
 from typing import Any
 
 from .config import Settings
@@ -19,15 +18,8 @@ from .historian import (
     build_event,
     current_operation,
     operation_context,
-    replace_operation,
-    reset_operation,
 )
-from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
-from .errors import (
-    CiderAgentError,
-    CiderValidationError,
-    TextRequestExecutionError,
-)
+from .errors import CiderValidationError
 from .results import EngineActionResult, TextRequestResult
 from .resolver import (
     ResolvedAction,
@@ -37,22 +29,18 @@ from .resolver import (
 )
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore, close_connections
-from .output import (
-    compact_resolved_action,
-    finalize_output,
-    summarize_execution,
-)
 from .matching import artist_track_score
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
-from .utils import _clean_id, _elapsed_ms, _extract_is_playing, _preference_target, _track_payload
+from .utils import _clean_id, _extract_is_playing, _preference_target, _track_payload
 # :class:`vesper.session.SessionEngine` can be imported at module top now that
 # the session modules no longer import from ``vesper.service`` (issue #44).
 from .session import SessionEngine
 from .preference_controller import PreferenceController
 from .search_controller import SearchController
 from .playback_controller import PlaybackController
+from .text_request_controller import TextRequestController
 
 
 LOGGER = logging.getLogger(__name__)
@@ -114,6 +102,7 @@ class CiderAgentService:
         self._preferences_ctrl = PreferenceController(self, preferences=self._preferences)
         self._search_ctrl = SearchController(self, rpc=self._rpc)
         self._playback_ctrl = PlaybackController(self, rpc=self._rpc, preferences=self._preferences, settings=self._settings)
+        self._text_request_ctrl = TextRequestController(self)
         self._genre_cache = self._search_ctrl._genre_cache
         self.reconcile_session_runtime()
 
@@ -282,27 +271,9 @@ class CiderAgentService:
         return datetime.now(UTC).isoformat(timespec="seconds")
 
     def list_action_definitions(self, *, text_exposable_only: bool = False, public_only: bool = True) -> list[dict[str, Any]]:
-        definitions_source = (
-            list_public_action_definitions()
-            if public_only and not text_exposable_only
-            else list_action_definitions(text_exposable_only=text_exposable_only)
+        return self._text_request_ctrl.list_action_definitions(
+            text_exposable_only=text_exposable_only, public_only=public_only
         )
-        return [
-            {
-                "name": definition.name,
-                "description": definition.description,
-                "summary_label": definition.summary_label,
-                "parameter_schema": definition.parameter_schema,
-                "required_fields": list(definition.required_fields),
-                "read_only": definition.read_only,
-                "text_exposable": definition.text_exposable,
-                "public_exposed": definition.public_exposed,
-                "session_aware": definition.session_aware,
-                "deferred_a2a_eligible": definition.deferred_a2a_eligible,
-                "advanced_only": definition.advanced_only,
-            }
-            for definition in definitions_source
-        ]
 
     def reconcile_session_runtime(self) -> None:
         self._session.reconcile_session_runtime()
@@ -634,102 +605,22 @@ class CiderAgentService:
         )
 
     def resolve_text_request(self, text: str) -> ResolvedAction:
-        return self._resolver.resolve(text, self)
+        return self._text_request_ctrl.resolve_text_request(text)
 
     def execute_text_request(self, text: str) -> TextRequestResult:
-        with self.operation():
-            request_event_id = self._emit(
-                "music.request.received",
-                {
-                    "caller": self._caller(),
-                    "request": text,
-                    "resolved_action": None,
-                },
-                source="app://vesper/request",
-            )
-            operation_token = replace_operation(causation_id=request_event_id)
-            try:
-                return self._execute_text_request(text)
-            finally:
-                reset_operation(operation_token)
+        return self._text_request_ctrl.execute_text_request(text)
 
     def _execute_text_request(self, text: str) -> TextRequestResult:
-        try:
-            started_debug_episode = self._begin_resolver_debug_episode(f"text-request: {text.strip()}")
-            started_at = time.perf_counter()
-            resolve_started_at = time.perf_counter()
-            resolved = self.resolve_text_request(text)
-            resolve_ms = _elapsed_ms(resolve_started_at)
-            resolved_action = compact_resolved_action(resolved.action, resolved.parameters, self.response_detail())
-            execute_started_at = time.perf_counter()
-            try:
-                execution = self.execute_action(resolved.action, resolved.parameters)
-            except CiderAgentError as exc:
-                self._record_error("service", resolved.action, exc)
-                error = {"type": exc.__class__.__name__, "message": str(exc)}
-                timings = None
-                if self.include_timing_debug():
-                    timings = {
-                        "resolve_ms": resolve_ms,
-                        "execute_ms": _elapsed_ms(execute_started_at),
-                        "total_ms": _elapsed_ms(started_at),
-                    }
-                failure = TextRequestResult(
-                    status="error",
-                    input=text,
-                    resolver=resolved.resolver,
-                    resolved_action=resolved_action,
-                    execution=EngineActionResult(action=resolved.action, result={}),
-                    reasoning=resolved.reasoning,
-                    resolver_raw_content=resolved.raw_content,
-                    resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
-                    timings=timings,
-                    error=error,
-                )
-                raise TextRequestExecutionError(str(exc), failure.as_dict()) from exc
-            summary = summarize_execution(execution.as_dict())
-            timings = None
-            if self.include_timing_debug():
-                timings = {
-                    "resolve_ms": resolve_ms,
-                    "execute_ms": _elapsed_ms(execute_started_at),
-                    "total_ms": _elapsed_ms(started_at),
-                }
-            return TextRequestResult(
-                input=text,
-                resolver=resolved.resolver,
-                resolved_action=resolved_action,
-                execution=execution,
-                summary=summary,
-                reasoning=resolved.reasoning,
-                resolver_raw_content=resolved.raw_content,
-                resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
-                timings=timings,
-            )
-        except CiderAgentError as exc:
-            if not isinstance(exc, TextRequestExecutionError):
-                self._record_error("resolver", "resolve_text_request", exc)
-            raise
-        finally:
-            self._end_resolver_debug_episode(locals().get("started_debug_episode", False))
+        return self._text_request_ctrl._execute_text_request(text)
 
     def handle_text_request(self, text: str) -> dict[str, Any]:
-        return self.execute_text_request(text).as_dict()
+        return self._text_request_ctrl.handle_text_request(text)
 
     def execute_action(self, action: str, parameters: dict[str, Any] | None = None) -> EngineActionResult:
-        params = parameters or {}
-        definition = get_action_definition(action)
-        if definition is None:
-            raise CiderValidationError(f"Unsupported action: {action}")
-        try:
-            result = definition.executor(self, params)
-        except (KeyError, TypeError, ValueError) as exc:
-            self._record_error("service", action, exc)
-            raise CiderValidationError(f"Invalid parameters for action {action}: {exc}") from exc
-        return EngineActionResult(action=action, result=finalize_output(result, self.response_detail(), self.include_timing_debug()))
+        return self._text_request_ctrl.execute_action(action, parameters)
 
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.execute_action(action, parameters).as_dict()
+        return self._text_request_ctrl.run_action(action, parameters)
 
     def _play_session_track_with_debug_episode(
         self,
