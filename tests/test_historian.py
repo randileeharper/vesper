@@ -26,7 +26,7 @@ from vesper.storage import PreferenceStore
 def _enabled_settings(settings: Settings, **overrides: Any) -> Settings:
     values = {
         key: getattr(settings, key)
-        for key in settings.__dataclass_fields__
+        for key in type(settings).model_fields
         if key != "config_path"
     }
     values.update(
