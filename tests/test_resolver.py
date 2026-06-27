@@ -1375,3 +1375,56 @@ def test_play_session_request_text_is_normalized_to_request(settings: Settings, 
     assert resolved.action == "play_session"
     assert resolved.parameters["request"] == "upbeat and energetic music for cleaning the house"
     assert "request_text" not in resolved.parameters
+
+
+def test_resolver_rejects_action_outside_allowlist(settings: Settings, service) -> None:
+    """An advanced_only/internal action returned by the model must not execute.
+
+    The resolver prompt advertises only RESOLVER_ACTION_NAMES. If the model
+    (benignly or via prompt injection through catalog text) returns an action
+    like play_item that exists in ACTION_REGISTRY but is not resolver-selectable,
+    resolution must fail rather than pass the action through to execute_action.
+    """
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class InjectedActionTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "play_item",
+                                    "parameters": {"item_id": "1440818839"},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=InjectedActionTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    with pytest.raises(ResolverError):
+        resolver.resolve("play a song", service)

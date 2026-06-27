@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from .action_registry import list_resolver_action_definitions
+from .action_registry import RESOLVER_ACTION_NAMES, list_resolver_action_definitions
 from .config import Settings
 from .errors import ResolverError
 from .prompts import load_prompt
@@ -276,6 +276,10 @@ class OpenAICompatibleResolver:
             raise ResolverError("Resolver output parameters must be an object.")
         parameters = self._normalize_parameters(action, parameters, original_text=text)
         action, parameters = self._normalize_playback_intent(action, parameters)
+        if action not in RESOLVER_ACTION_NAMES:
+            raise ResolverError(
+                f"Resolver returned action '{action}' which is not in the resolver allowlist."
+            )
         return ResolvedAction(
             action=action,
             parameters=parameters,
