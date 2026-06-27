@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -249,7 +250,12 @@ def test_cli_and_a2a_emit_once_at_service_boundary(
 ) -> None:
     cli_sink = FakeHistorianSink()
     cli_service = _service(settings, cli_sink, tmp_path / "cli")
-    monkeypatch.setattr(cli, "get_service", lambda: cli_service)
+
+    @contextmanager
+    def _cli_service_context():
+        yield cli_service
+
+    monkeypatch.setattr(cli, "service_context", _cli_service_context)
     monkeypatch.setattr("sys.argv", ["vesper", "pause"])
     cli.main()
     capsys.readouterr()

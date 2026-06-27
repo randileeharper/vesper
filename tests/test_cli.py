@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from typing import Any
 
 import pytest
 
@@ -8,37 +10,69 @@ from vesper import cli
 from vesper.errors import TextRequestExecutionError
 
 
+def _patch_service(monkeypatch, service: Any) -> None:
+    """Make ``cli.service_context`` yield *service* and call its ``close()``."""
+
+    @contextmanager
+    def _ctx():
+        try:
+            yield service
+        finally:
+            service.close()
+
+    monkeypatch.setattr(cli, "service_context", _ctx)
+
+
 def test_cli_play_calls_service_directly(monkeypatch, capsys) -> None:
     class FakeService:
+        def __init__(self) -> None:
+            self.closed = False
+
         def play(self):
             return {"status": "ok", "result": {"path": "/play", "body": None}}
 
-    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+        def close(self) -> None:
+            self.closed = True
+
+    service = FakeService()
+    _patch_service(monkeypatch, service)
     monkeypatch.setattr("sys.argv", ["vesper", "play"])
 
     cli.main()
 
     captured = capsys.readouterr()
     assert json.loads(captured.out)["path"] == "/play"
+    assert service.closed is True
 
 
 def test_cli_ask_calls_service_directly(monkeypatch, capsys) -> None:
     class FakeService:
+        def __init__(self) -> None:
+            self.closed = False
+
         def handle_text_request(self, text: str):
             assert text == "play some kep1er"
             return {"status": "ok", "input": text, "summary": "done"}
 
-    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+        def close(self) -> None:
+            self.closed = True
+
+    service = FakeService()
+    _patch_service(monkeypatch, service)
     monkeypatch.setattr("sys.argv", ["vesper", "ask", "play some kep1er"])
 
     cli.main()
 
     captured = capsys.readouterr()
     assert json.loads(captured.out)["input"] == "play some kep1er"
+    assert service.closed is True
 
 
 def test_cli_session_queue_calls_service(monkeypatch, capsys) -> None:
     class FakeService:
+        def __init__(self) -> None:
+            self.closed = False
+
         def session_queue(self, *, limit: int, include_history: bool):
             return {
                 "status": "ok",
@@ -47,7 +81,11 @@ def test_cli_session_queue_calls_service(monkeypatch, capsys) -> None:
                 "items": [{"title": "Queued"}],
             }
 
-    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+        def close(self) -> None:
+            self.closed = True
+
+    service = FakeService()
+    _patch_service(monkeypatch, service)
     monkeypatch.setattr("sys.argv", ["vesper", "--json", "session", "queue", "--limit", "7", "--all"])
 
     cli.main()
@@ -57,10 +95,14 @@ def test_cli_session_queue_calls_service(monkeypatch, capsys) -> None:
     assert payload["limit"] == 7
     assert payload["include_history"] is True
     assert payload["items"][0]["title"] == "Queued"
+    assert service.closed is True
 
 
 def test_cli_session_candidates_calls_service(monkeypatch, capsys) -> None:
     class FakeService:
+        def __init__(self) -> None:
+            self.closed = False
+
         def session_candidates(self, *, window: int):
             return {
                 "status": "ok",
@@ -68,7 +110,11 @@ def test_cli_session_candidates_calls_service(monkeypatch, capsys) -> None:
                 "pools": [{"source": {"kind": "artist", "term": "Pink"}, "cursor": 0}],
             }
 
-    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+        def close(self) -> None:
+            self.closed = True
+
+    service = FakeService()
+    _patch_service(monkeypatch, service)
     monkeypatch.setattr("sys.argv", ["vesper", "--json", "session", "candidates", "--window", "5"])
 
     cli.main()
@@ -77,14 +123,22 @@ def test_cli_session_candidates_calls_service(monkeypatch, capsys) -> None:
     payload = json.loads(captured.out)
     assert payload["window"] == 5
     assert payload["pools"][0]["source"]["term"] == "Pink"
+    assert service.closed is True
 
 
 def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
     class FakeService:
+        def __init__(self) -> None:
+            self.closed = False
+
         def handle_text_request(self, text: str):
             raise TextRequestExecutionError("No active session.", {"status": "error", "message": "No active session."})
 
-    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+        def close(self) -> None:
+            self.closed = True
+
+    service = FakeService()
+    _patch_service(monkeypatch, service)
     monkeypatch.setattr("sys.argv", ["vesper", "ask", "stop session"])
 
     with pytest.raises(SystemExit, match="1"):
@@ -92,6 +146,8 @@ def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
 
     captured = capsys.readouterr()
     assert json.loads(captured.err)["message"] == "No active session."
+    # close() must still run even when the command raises.
+    assert service.closed is True
 
 
 def test_serve_requires_transport_flag(monkeypatch) -> None:

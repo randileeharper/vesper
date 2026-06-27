@@ -8,7 +8,7 @@ import json
 import sys
 from typing import Any
 
-from .app import get_service, get_settings
+from .app import get_settings, service_context
 from .errors import CiderAgentError, TextRequestExecutionError
 
 
@@ -81,39 +81,38 @@ def main() -> None:
             create_mcp_server().run("stdio")
             return
 
-        service = get_service()
-        operation = getattr(service, "operation", None)
-        with operation(caller="cli") if callable(operation) else nullcontext():
-            if args.command == "play":
-                payload = service.play()
-            elif args.command == "pause":
-                payload = service.pause()
-            elif args.command == "stop":
-                payload = service.stop()
-            elif args.command == "ask":
-                payload = service.handle_text_request(args.text)
-            elif args.command == "session":
-                if args.session_command == "queue":
-                    payload = service.session_queue(limit=args.limit, include_history=args.all)
-                elif args.session_command == "candidates":
-                    payload = service.session_candidates(window=args.window)
+        with service_context() as service:
+            operation = getattr(service, "operation", None)
+            with operation(caller="cli") if callable(operation) else nullcontext():
+                if args.command == "play":
+                    payload = service.play()
+                elif args.command == "pause":
+                    payload = service.pause()
+                elif args.command == "stop":
+                    payload = service.stop()
+                elif args.command == "ask":
+                    payload = service.handle_text_request(args.text)
+                elif args.command == "session":
+                    if args.session_command == "queue":
+                        payload = service.session_queue(limit=args.limit, include_history=args.all)
+                    elif args.session_command == "candidates":
+                        payload = service.session_candidates(window=args.window)
+                    else:  # pragma: no cover - argparse enforces commands
+                        raise RuntimeError(f"Unhandled session command: {args.session_command}")
+                elif args.command == "preferences":
+                    if args.preferences_command == "list":
+                        payload = service.list_preferences()
+                    else:
+                        payload = service.forget_preference(args.preference_id)
                 else:  # pragma: no cover - argparse enforces commands
-                    raise RuntimeError(f"Unhandled session command: {args.session_command}")
-            elif args.command == "preferences":
-                if args.preferences_command == "list":
-                    payload = service.list_preferences()
-                else:
-                    payload = service.forget_preference(args.preference_id)
-            else:  # pragma: no cover - argparse enforces commands
-                raise RuntimeError(f"Unhandled command: {args.command}")
+                    raise RuntimeError(f"Unhandled command: {args.command}")
+                _print_payload(payload, args.json)
     except TextRequestExecutionError as exc:
         print(json.dumps(exc.payload, indent=2, sort_keys=True), file=sys.stderr)
         raise SystemExit(1) from None
     except CiderAgentError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
-
-    _print_payload(payload, args.json)
 
 
 if __name__ == "__main__":
