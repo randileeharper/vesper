@@ -297,6 +297,33 @@ def test_historian_unavailability_does_not_change_success(settings: Settings, tm
     assert "Historian delivery failed" in caplog.text
 
 
+def test_unexpected_sink_error_propagates_instead_of_being_swallowed(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """An unexpected (non-HistorianDeliveryError) failure from the historian
+    sink must propagate rather than be swallowed by the best-effort handler.
+
+    Regression guard for issue #47: the bare ``except Exception`` in
+    ``CiderAgentService._emit`` used to mask any sink failure as a routine
+    delivery problem. It now narrows to ``HistorianDeliveryError``.
+    """
+
+    class PoisonedSink:
+        def emit(self, event):
+            raise RuntimeError("sink is corrupted")
+
+        def emit_batch(self, events):
+            raise RuntimeError("sink is corrupted")
+
+        def close(self):
+            return None
+
+    service = _service(settings, PoisonedSink(), tmp_path)
+
+    with pytest.raises(RuntimeError, match="sink is corrupted"):
+        service.pause()
+
+
 def test_rpc_failures_emit_sanitized_event(settings: Settings, tmp_path: Path) -> None:
     sink = FakeHistorianSink()
     configured = _enabled_settings(settings, database_path=tmp_path / "rpc-failure.db")
