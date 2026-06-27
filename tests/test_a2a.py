@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
 
 from google.protobuf.json_format import MessageToDict

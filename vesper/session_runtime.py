@@ -16,9 +16,15 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .utils import _clean_id
+
+if TYPE_CHECKING:
+    import threading
+
+    from .session import SessionHost
+    from .storage import PreferenceStore
 
 # Sentinel stored as ``pending_stop_track_id`` when Cider reports playback
 # stopped with no current track at all. Real track ids are numeric, so this
@@ -36,6 +42,12 @@ class SessionRuntimeMixin:
     ``self._preferences``, ``self._session_runtime`` (``dict[int, dict]``),
     and ``self._session_runtime_lock``.
     """
+
+    if TYPE_CHECKING:
+        _host: SessionHost
+        _preferences: PreferenceStore
+        _session_runtime: dict[int, dict[str, Any]]
+        _session_runtime_lock: threading.Lock
 
     def _mark_session_track_rejected(self, session_id: int, track_id: str) -> None:
         self._preferences.mark_session_queue_track(session_id, track_id, "rejected")

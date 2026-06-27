@@ -19,12 +19,18 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .catalog import flatten_playlist_item as _flatten_playlist_item
 from .matching import normalize_match_text as _normalize_match_text
 from .resolver import SessionSearchSource, SessionTrackSelection
 from .utils import _clean_id, _elapsed_ms, _encode_query
+
+if TYPE_CHECKING:
+    import random
+
+    from .session import SessionHost
+    from .storage import PreferenceStore
 
 
 class SessionSourcesMixin:
@@ -36,6 +42,13 @@ class SessionSourcesMixin:
     ``self._preferences``, ``self._session_runtime``/``self._session_runtime_lock``,
     ``self._random``, and the ``self._debug_candidate_*`` counters.
     """
+
+    if TYPE_CHECKING:
+        _host: SessionHost
+        _preferences: PreferenceStore
+        _random: random.Random
+        _debug_candidate_query_search_count: int
+        _debug_candidate_query_search_ms: float
 
     def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -59,7 +72,8 @@ class SessionSourcesMixin:
         seen: set[str] = set()
         for item in value:
             if isinstance(item, SessionSearchSource):
-                kind, term = item.kind, item.term
+                kind: Any = item.kind
+                term: Any = item.term
             elif isinstance(item, dict):
                 kind, term = item.get("kind"), item.get("term")
             else:
@@ -490,7 +504,7 @@ class SessionSourcesMixin:
                 artist_id = _clean_id(artist.get("id"))
                 if not artist_id:
                     return [], {}
-                tracks = self._host._catalog_relationship_tracks(f"/artists/{artist_id}/view/top-songs")
+                tracks: list[dict[str, Any]] = self._host._catalog_relationship_tracks(f"/artists/{artist_id}/view/top-songs")
                 return tracks, {
                     "resolved_artist_id": artist_id,
                     "resolved_name": artist.get("attributes", {}).get("name"),
@@ -507,7 +521,7 @@ class SessionSourcesMixin:
             if source.kind == "preference":
                 return [], {}
             if source.kind == "legacy":
-                tracks: list[dict[str, Any]] = []
+                tracks = []
                 offset = 0
                 while len(tracks) < self._host.SESSION_SEARCH_RESULT_LIMIT:
                     limit = min(self._host.SESSION_SEARCH_PAGE_LIMIT, self._host.SESSION_SEARCH_RESULT_LIMIT - len(tracks))

@@ -8,7 +8,7 @@ import uuid
 from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import uvicorn
 from fastapi import FastAPI
@@ -39,7 +39,7 @@ from a2a.types import (
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, PROTOCOL_VERSION_1_0, TransportProtocol
 from a2a.utils.errors import InternalError, InvalidParamsError
 
-from .action_registry import get_action_definition, is_public_action
+from .action_registry import is_public_action
 from .app import get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
 from .mcp_server import create_mcp_server
@@ -412,7 +412,7 @@ def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> 
     if include_mcp:
         mcp_server = create_mcp_server(streamable_http_path="/", manage_session_worker=False)
         mcp_app = mcp_server.streamable_http_app()
-        mcp_endpoint = mcp_app.routes[0].endpoint
+        mcp_endpoint = cast(Route, mcp_app.routes[0]).endpoint
 
     app = FastAPI(title="Vesper", version="0.1.0", lifespan=_create_lifespan(mcp_server.session_manager if mcp_server else None))
 

@@ -158,7 +158,7 @@ def replace_operation(**updates: Any) -> Any:
     current = current_operation()
     if current is None:
         return None
-    values = {
+    values: dict[str, Any] = {
         "correlation_id": current.correlation_id,
         "caller": current.caller,
         "causation_id": current.causation_id,

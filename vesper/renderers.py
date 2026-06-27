@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from google.protobuf.json_format import MessageToDict
 
 from .results import EngineActionResult, TextRequestResult
-
-if TYPE_CHECKING:
-    from a2a.types import Message, Task
 
 
 def render_text_result_for_a2a(result: TextRequestResult) -> tuple[dict[str, Any], dict[str, Any]]:

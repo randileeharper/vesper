@@ -40,7 +40,7 @@ def compact_track(track: dict[str, Any]) -> dict[str, Any]:
 def compact_music_preference(preference: dict[str, Any]) -> dict[str, Any]:
     preference_type = preference.get("preference_type")
     if preference_type == "favored_artist":
-        keys = ("artist_name",)
+        keys: tuple[str, ...] = ("artist_name",)
     else:
         keys = ("title", "artist_name")
     return {key: preference[key] for key in keys if preference.get(key) is not None}

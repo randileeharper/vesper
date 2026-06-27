@@ -23,7 +23,7 @@ from typing import Any, Protocol
 
 from .errors import CiderAgentError, CiderValidationError
 from .output import compact_output
-from .resolver import SessionQueryPlan, SessionSearchSource
+from .resolver import Resolver, SessionQueryPlan, SessionSearchSource
 from .session_queue import SessionQueueMixin
 from .session_runtime import SessionRuntimeMixin
 from .session_sources import SessionSourcesMixin
@@ -165,6 +165,20 @@ class SessionHost(Protocol):
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         ...
 
+    # Class-level constants used by the session worker and search planning.
+    SESSION_REFILL_INTERVAL_SECONDS: float
+    SESSION_SEARCH_RESULT_LIMIT: int
+    SESSION_SEARCH_PAGE_LIMIT: int
+    SESSION_STOREFRONT: str
+    SESSION_ADVANCE_COOLDOWN_SECONDS: float
+    PREFERENCE_SEED_SEARCH_LIMIT: int
+    PREFERENCE_SEED_ARTIST_CAP: int
+    PREFERENCE_SEED_POOL_QUERY: str
+    PREFERENCE_SEED_SOURCE: SessionSearchSource
+
+    # The configured resolver, used for adaptive session planning.
+    _resolver: Resolver
+
 
 class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin):
     """Owns adaptive-session runtime state, the refill worker, and the
@@ -286,7 +300,7 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
     def session_status(self, *, include_recent_tracks: bool = True, compact: bool | None = None) -> dict[str, Any]:
         session = self._preferences.get_active_session()
         if session is None:
-            payload = {"status": "ok", "session": None}
+            payload: dict[str, Any] = {"status": "ok", "session": None}
             return compact_output(payload, self._host.include_timing_debug()) if compact is not False and self._host.response_detail() == "compact" else payload
         payload = {"status": "ok", "session": session}
         if include_recent_tracks:

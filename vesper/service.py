@@ -27,9 +27,6 @@ from .action_registry import get_action_definition, list_action_definitions, lis
 from .catalog import (
     catalog_relationship_tracks as _catalog_relationship_tracks_impl,
     catalog_resource_search as _catalog_resource_search_impl,
-    flatten_album_item as _flatten_album_item,
-    flatten_artist_item as _flatten_artist_item,
-    flatten_playlist_item as _flatten_playlist_item,
     flatten_track_item as _flatten_track_item,
     get_library_playlist as _get_library_playlist_impl,
     get_library_playlist_tracks as _get_library_playlist_tracks_impl,
@@ -41,11 +38,9 @@ from .catalog import (
     search_library as _search_library_impl,
     search_library_playlists as _search_library_playlists_impl,
     search_library_tracks as _search_library_tracks_impl,
-    track_attributes as _track_attributes,
 )
 from .errors import (
     CiderAgentError,
-    CiderRpcError,
     CiderValidationError,
     PreferenceStoreError,
     TextRequestExecutionError,
@@ -54,15 +49,12 @@ from .results import EngineActionResult, TextRequestResult
 from .resolver import (
     ResolvedAction,
     Resolver,
-    SessionQueryPlan,
     SessionSearchSource,
-    SessionTrackSelection,
     build_resolver,
 )
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore, close_connections
 from .output import (
-    compact_output,
     compact_resolved_action,
     compact_track,
     finalize_output,
@@ -74,8 +66,6 @@ from .matching import (
     best_artist_track_matches,
     best_playlist_match,
     best_track_match,
-    normalize_match_text as _normalize_match_text,
-    normalize_title_match_text as _normalize_title_match_text,
     top_pool_order,
 )
 from .validation import (
@@ -87,7 +77,7 @@ from .validation import (
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
-from .utils import _clean_id, _elapsed_ms, _encode_query
+from .utils import _clean_id, _elapsed_ms
 # :class:`vesper.session.SessionEngine` can be imported at module top now that
 # the session modules no longer import from ``vesper.service`` (issue #44).
 from .session import SessionEngine
@@ -366,23 +356,24 @@ class CiderAgentService:
         self._session.stop_background_session_worker(timeout=timeout)
 
     def status(self) -> dict[str, Any]:
+        playback = self.playback_snapshot()
         payload = {
             "status": "ok",
             "source": "vesper",
             "config": self._settings.sanitized(),
-            "playback": self.playback_snapshot(),
+            "playback": playback,
             "preferences_count": len(self._preferences.list_preferences()),
         }
         if self.response_detail() == "compact":
-            queue = payload["playback"].get("queue", {})
+            queue = playback.get("queue", {})
             session = self._preferences.get_active_session()
             return {
                 "status": "ok",
                 "source": "vesper",
                 "playback": {
-                    "is_playing": payload["playback"].get("is_playing"),
-                    "track": compact_track(payload["playback"].get("track", {})),
-                    "volume": payload["playback"].get("volume"),
+                    "is_playing": playback.get("is_playing"),
+                    "track": compact_track(playback.get("track", {})),
+                    "volume": playback.get("volume"),
                     "queue_length": queue.get("count", 0) if isinstance(queue, dict) else 0,
                 },
                 "queue": {

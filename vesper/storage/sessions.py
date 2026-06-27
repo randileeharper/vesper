@@ -73,7 +73,7 @@ def start_session(database_path: Path, *, request_text: str, mode: str = "adapti
                     """,
                     (request_text, mode),
                 )
-                session_id = int(cursor.lastrowid)
+                session_id = int(cursor.lastrowid or 0)
         except sqlite3.Error as exc:
             raise PreferenceStoreError(f"Could not start session: {exc}") from exc
         session = get_session(database_path, session_id)

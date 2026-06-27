@@ -21,7 +21,7 @@ resolve against the combined class.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .resolver import (
     SessionQueryPlan,
@@ -31,6 +31,12 @@ from .resolver import (
     _normalize_eligible_indices,
 )
 from .utils import _clean_id
+
+if TYPE_CHECKING:
+    import random
+
+    from .session import SessionHost
+    from .storage import PreferenceStore
 
 
 class SessionQueueMixin:
@@ -43,6 +49,12 @@ class SessionQueueMixin:
     ``self._random``, ``self._session_queue_batch_size``, and the
     ``self._debug_candidate_*`` counters.
     """
+
+    if TYPE_CHECKING:
+        _host: SessionHost
+        _preferences: PreferenceStore
+        _random: random.Random
+        _session_queue_batch_size: int
 
     def _normalize_queue_policy(self, value: Any) -> str:
         policy = str(value or "source_order").strip().lower()

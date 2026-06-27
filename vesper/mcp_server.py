@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
@@ -42,7 +42,7 @@ def create_mcp_server(*, streamable_http_path: str = "/mcp", manage_session_work
         streamable_http_path=streamable_http_path,
         json_response=True,
         stateless_http=True,
-        log_level=settings.log_level,
+        log_level=cast(Any, settings.log_level),
         lifespan=_mcp_lifespan if manage_session_worker else _embedded_mcp_lifespan,
     )
 

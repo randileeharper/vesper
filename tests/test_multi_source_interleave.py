@@ -20,8 +20,8 @@ import json
 from typing import Any
 
 import httpx
-import pytest
 
+from vesper.config import Settings
 from vesper.resolver import (
     OpenAICompatibleResolver,
     ResolvedAction,
@@ -153,9 +153,7 @@ def test_interleave_no_decks_returns_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_resolver_settings(settings) -> "Settings":  # type: ignore[name-defined]
-    from vesper.config import Settings
-
+def _make_resolver_settings(settings) -> Settings:
     return Settings(
         http_host=settings.http_host,
         http_port=settings.http_port,

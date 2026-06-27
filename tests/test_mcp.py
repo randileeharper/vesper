@@ -7,7 +7,6 @@ import httpx
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.memory import create_connected_server_and_client_session
-import pytest
 
 from vesper import a2a, mcp_server
 from vesper.a2a import create_http_app

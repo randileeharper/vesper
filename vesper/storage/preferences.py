@@ -220,7 +220,7 @@ def _upsert_music_preference(
                     """,
                     tuple(payload.get(column) if column != "preference_type" else preference_type for column in columns),
                 )
-                preference_id = int(cursor.lastrowid)
+                preference_id = int(cursor.lastrowid or 0)
             else:
                 preference_id = int(existing["id"])
                 assignments = ", ".join(f"{column} = ?" for column in columns[1:])

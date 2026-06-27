@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "mypy>=1.0",
+  "ruff>=0.6",
+  "types-protobuf",
 ]
 
 [project.scripts]
@@ -30,3 +33,33 @@ packages = ["vesper"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Baseline rules: pyflakes (F), pycodestyle errors (E) and warnings (W).
+# E501 (line-too-long) is ignored because the codebase is not formatted to a
+# fixed line length; enabling it would produce a large, unrelated diff. More
+# rule groups (I, UP, B, etc.) can be added incrementally once the codebase is
+# formatted.
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# The session mixins (SessionSourcesMixin, SessionQueueMixin,
+# SessionRuntimeMixin) use cooperative inheritance: each mixin calls
+# methods/attributes defined on sibling mixins or the combined
+# SessionEngine. mypy cannot follow these cross-mixin references, so
+# attr-defined is suppressed for those three modules only.
+[[tool.mypy.overrides]]
+module = [
+  "vesper.session_sources",
+  "vesper.session_queue",
+  "vesper.session_runtime",
+]
+disable_error_code = ["attr-defined"]

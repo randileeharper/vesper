@@ -7,7 +7,7 @@ import pytest
 from vesper.action_registry import get_action_definition
 from vesper.config import Settings
 from vesper.errors import CiderValidationError, TextRequestExecutionError
-from vesper.resolver import ResolvedAction, SessionSearchSource
+from vesper.resolver import ResolvedAction
 from vesper.service import CiderAgentService
 from vesper.session import SessionWorkerCancelled
 from vesper.storage import PreferenceStore
