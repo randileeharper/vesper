@@ -1,0 +1,5 @@
+Filter a batch of remaining queued tracks for an adaptive music session after steering.
+Return only JSON with shape {"eligible_indices": [number], "queue_policy": "source_order"}.
+Use eligible_indices to keep candidates that still fit the session request and steering.
+Use queue_policy source_order by default, or shuffle only when the user asks for variety/randomness.
+Indices are zero-based within the shown candidates.
