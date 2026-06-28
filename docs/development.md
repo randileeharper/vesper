@@ -4,43 +4,41 @@ This guide is for contributors and agents changing Vesper.
 
 ## Environment
 
-Use the project virtual environment for Python commands:
+Run `uv sync --extra dev` to create the `.venv` and install the project with dev dependencies:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .[dev]
+uv sync --extra dev
 ```
 
-When running tests or Python modules in this repository, prefer the explicit virtualenv path:
+Use `uv run` for all Python commands. `uv run` executes commands inside the environment managed by `uv sync`:
 
 ```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python -m compileall vesper tests
+uv run pytest -q
+uv run python -m compileall vesper tests
 ```
 
-Do not assume the system Python has the project dependencies installed.
+Run `uv sync --extra dev` first if the environment does not exist; `uv run` will then manage execution within it.
 
 ## Test Commands
 
 Preferred full verification:
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run pytest -q
 ```
 
 Focused checks:
 
 ```bash
-.venv/bin/python -m pytest tests/test_service.py -q
-.venv/bin/python -m pytest tests/test_config.py -q
-.venv/bin/python -m pytest tests/test_a2a.py tests/test_mcp.py -q
+uv run pytest tests/test_service.py -q
+uv run pytest tests/test_config.py -q
+uv run pytest tests/test_a2a.py tests/test_mcp.py -q
 ```
 
 Syntax/import check:
 
 ```bash
-.venv/bin/python -m compileall vesper tests
+uv run python -m compileall vesper tests
 ```
 
 ## Project Layout
