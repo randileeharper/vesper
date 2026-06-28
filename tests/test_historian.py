@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -297,15 +298,17 @@ def test_historian_unavailability_does_not_change_success(settings: Settings, tm
     assert "Historian delivery failed" in caplog.text
 
 
-def test_unexpected_sink_error_propagates_instead_of_being_swallowed(
-    settings: Settings, tmp_path: Path
+def test_unexpected_sink_error_is_logged_not_propagated(
+    settings: Settings, tmp_path: Path, caplog
 ) -> None:
     """An unexpected (non-HistorianDeliveryError) failure from the historian
-    sink must propagate rather than be swallowed by the best-effort handler.
+    sink must not fail the user-facing operation. It is logged at error level
+    so it remains visible and actionable.
 
-    Regression guard for issue #47: the bare ``except Exception`` in
-    ``CiderAgentService._emit`` used to mask any sink failure as a routine
-    delivery problem. It now narrows to ``HistorianDeliveryError``.
+    Overturns the issue #47 design (which narrowed the handler so unexpected
+    failures propagated); issue #90 re-established that Historian delivery is
+    best-effort for *all* sink failures, since the sink can raise
+    httpx.HTTPStatusError and similar that escape HistorianDeliveryError.
     """
 
     class PoisonedSink:
@@ -320,8 +323,40 @@ def test_unexpected_sink_error_propagates_instead_of_being_swallowed(
 
     service = _service(settings, PoisonedSink(), tmp_path)
 
-    with pytest.raises(RuntimeError, match="sink is corrupted"):
-        service.pause()
+    with caplog.at_level(logging.ERROR, logger="vesper.events"):
+        result = service.pause()
+
+    assert result["status"] == "ok"
+    assert "Unexpected historian sink failure" in caplog.text
+    assert "sink is corrupted" in caplog.text
+
+
+def test_http_status_error_from_sink_does_not_fail_operation(
+    settings: Settings, tmp_path: Path, caplog
+) -> None:
+    """A 4xx response from the historian raises httpx.HTTPStatusError, which
+    escapes HistorianDeliveryError. The best-effort handler must swallow it so
+    the user-facing music operation still succeeds.
+
+    Regression guard for issue #90: a configured Historian returning a 4xx
+    was propagating out of emit and failing the surrounding operation.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, request=request, json={"detail": "forbidden"})
+
+    sink = HttpHistorianSink(
+        _enabled_settings(settings),
+        client=httpx.Client(base_url="https://historian.test", transport=httpx.MockTransport(handler)),
+        sleep=lambda _: None,
+    )
+    service = _service(settings, sink, tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger="vesper.events"):
+        result = service.pause()
+
+    assert result["status"] == "ok"
+    assert "Unexpected historian sink failure" in caplog.text
 
 
 def test_rpc_failures_emit_sanitized_event(settings: Settings, tmp_path: Path) -> None:

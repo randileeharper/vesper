@@ -88,13 +88,25 @@ class EventEmitter:
             self._historian.emit(event)
         except HistorianDeliveryError as exc:
             # Historian delivery is best-effort: a failed delivery must never
-            # fail the surrounding operation. Only the documented delivery
-            # failure is swallowed (with a warning); unexpected sink failures
-            # propagate so they remain visible and actionable.
+            # fail the surrounding operation. Routine delivery failures are
+            # swallowed with a warning.
             import logging
 
             logging.getLogger(__name__).warning(
                 "Historian delivery failed for event_id=%s type=%s: %s",
+                event["id"],
+                event_type,
+                exc,
+            )
+        except Exception as exc:
+            # Unexpected sink failures (e.g. httpx.HTTPStatusError on a 4xx)
+            # are still best-effort: they must not fail the user-facing music
+            # operation. They are logged at error level so they remain visible
+            # and actionable without propagating to the caller.
+            import logging
+
+            logging.getLogger(__name__).error(
+                "Unexpected historian sink failure for event_id=%s type=%s: %r",
                 event["id"],
                 event_type,
                 exc,
