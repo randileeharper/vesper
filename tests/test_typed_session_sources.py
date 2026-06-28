@@ -34,7 +34,7 @@ def test_artist_source_uses_exact_artist_and_top_songs(service, monkeypatch) -> 
     monkeypatch.setattr(service, "_catalog_relationship_tracks", tracks)
 
     source = SessionSearchSource(kind="artist", term="RADWIMPS")
-    pool = service._build_session_query_pool({"id": 1}, source)
+    pool = service._session._build_session_query_pool({"id": 1}, source)
 
     assert searches == [("RADWIMPS", "artists", 5)]
     assert paths == ["/artists/right/view/top-songs"]
@@ -51,7 +51,7 @@ def test_genre_source_resolves_exact_cached_genre_and_chart(service, monkeypatch
         lambda path, storefront="us": paths.append(path) or [_track("pop-1", "Pop Song", "Artist")],
     )
 
-    pool = service._build_session_query_pool({"id": 1}, SessionSearchSource(kind="genre", term="Pop"))
+    pool = service._session._build_session_query_pool({"id": 1}, SessionSearchSource(kind="genre", term="Pop"))
 
     assert paths == ["/charts?types=songs&genre=14"]
     assert pool["resolved_genre_id"] == "14"
@@ -97,8 +97,8 @@ def test_vibe_source_selects_playlist_once_and_keeps_playlist_order(service, mon
     )
 
     source = SessionSearchSource(kind="vibe", term="upbeat pop")
-    service._ensure_session_query_pools({"id": 1, "request_text": "upbeat pop"}, [source])
-    service._ensure_session_query_pools({"id": 1, "request_text": "upbeat pop"}, [source])
+    service._session._ensure_session_query_pools({"id": 1, "request_text": "upbeat pop"}, [source])
+    service._session._ensure_session_query_pools({"id": 1, "request_text": "upbeat pop"}, [source])
     pool = next(iter(service._get_session_runtime(1)["query_pools"].values()))
 
     assert len(playlist_selections) == 1
@@ -138,7 +138,7 @@ def test_vibe_source_rephrases_empty_playlist_search_before_failing(service, mon
         lambda path, storefront="us": [_track("song-1", "Deep Work", "Artist")],
     )
 
-    pool = service._build_session_query_pool(
+    pool = service._session._build_session_query_pool(
         {"id": 1, "request_text": "play oddly specific productivity fog"},
         SessionSearchSource(kind="vibe", term="oddly specific productivity fog"),
     )
@@ -166,7 +166,7 @@ def test_vibe_source_uses_fallback_rephrase_when_resolver_has_no_alternate(servi
         lambda path, storefront="us": [_track("song-1", "Haze", "Artist")],
     )
 
-    pool = service._build_session_query_pool(
+    pool = service._session._build_session_query_pool(
         {"id": 1, "request_text": "play oddly specific productivity fog"},
         SessionSearchSource(kind="vibe", term="oddly specific productivity fog"),
     )
@@ -180,11 +180,11 @@ def test_typed_steering_adds_heterogeneous_sources(service) -> None:
     runtime = {
         "active_search_sources": [{"kind": "genre", "term": "Pop"}],
     }
-    update = service._normalize_session_search_update(
+    update = service._session._normalize_session_search_update(
         {"mode": "add", "sources": [{"kind": "artist", "term": "RADWIMPS"}]}
     )
 
-    sources = service._next_session_search_sources(runtime, update)
+    sources = service._session._next_session_search_sources(runtime, update)
 
     assert service._sources_payload(sources) == [
         {"kind": "genre", "term": "Pop"},
@@ -244,7 +244,7 @@ def test_empty_source_replans_once_with_rejected_source_excluded(service, monkey
     )
     session = service._preferences.start_session(request_text="play something energetic")
 
-    result = service._play_session_track(session, selection_strategy="test")
+    result = service._session._play_session_track(session, selection_strategy="test")
 
     assert result["tracks"][0]["title"] == "Sparkle"
     assert resolver.plans == 2

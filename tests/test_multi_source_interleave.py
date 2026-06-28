@@ -409,7 +409,7 @@ def test_additive_steering_interleaves_new_source_into_remaining_queue(service, 
     # newly added Nine Inch Nails rows.
     first_item_id = queue_before[0]["id"]
     service._preferences.mark_session_queue_item(first_item_id, "playing")
-    service._set_session_runtime(session["id"], current_queue_item_id=first_item_id)
+    service._session._set_session_runtime(session["id"], current_queue_item_id=first_item_id)
 
     service.steer_session(
         "add some nine inch nails",

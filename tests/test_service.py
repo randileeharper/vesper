@@ -328,7 +328,7 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
 
     service._rpc.is_playing = False
     service._rpc.current_track = None
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     playback = service.playback_snapshot()
@@ -336,10 +336,10 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
     # An empty now-playing snapshot is ambiguous: Cider can briefly report no
     # current track while one is still playing. Require two consecutive stopped
     # snapshots before treating playback as stopped.
-    assert service._should_advance_session(session, playback) is False
-    assert service._should_advance_session(session, playback) is True
+    assert service._session._should_advance_session(session, playback) is False
+    assert service._session._should_advance_session(session, playback) is True
 
-    result = service._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
+    result = service._session._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
 
     assert result["selection_strategy"] == "adaptive-session-auto-advance"
     assert result["tracks"][0]["title"] == "Liked Song"
@@ -353,10 +353,10 @@ def test_session_worker_does_not_advance_when_now_playing_has_remaining_time(ser
     service._rpc.is_playing = False
     service._rpc.current_track["attributes"]["currentPlaybackTime"] = 15
     service._rpc.current_track["attributes"]["remainingTime"] = 165
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
-    assert service._should_advance_session(session, service.playback_snapshot()) is False
+    assert service._session._should_advance_session(session, service.playback_snapshot()) is False
 
 
 def test_session_worker_does_not_advance_when_remaining_time_conflicts_with_progress(service) -> None:
@@ -367,10 +367,10 @@ def test_session_worker_does_not_advance_when_remaining_time_conflicts_with_prog
     service._rpc.is_playing = False
     service._rpc.current_track["attributes"]["currentPlaybackTime"] = 15
     service._rpc.current_track["attributes"]["remainingTime"] = 0
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
-    assert service._should_advance_session(session, service.playback_snapshot()) is False
+    assert service._session._should_advance_session(session, service.playback_snapshot()) is False
 
 
 def test_session_worker_does_not_advance_when_playing_state_is_unknown(service) -> None:
@@ -381,10 +381,10 @@ def test_session_worker_does_not_advance_when_playing_state_is_unknown(service) 
     playback = service.playback_snapshot()
     playback["is_playing"] = None
     playback["track"] = None
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
-    assert service._should_advance_session(session, playback) is False
+    assert service._session._should_advance_session(session, playback) is False
 
 
 def test_session_worker_can_advance_when_now_playing_track_has_ended(service) -> None:
@@ -395,10 +395,10 @@ def test_session_worker_can_advance_when_now_playing_track_has_ended(service) ->
     service._rpc.is_playing = False
     service._rpc.current_track["attributes"]["currentPlaybackTime"] = 180
     service._rpc.current_track["attributes"]["remainingTime"] = 0
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
-    assert service._should_advance_session(session, service.playback_snapshot()) is True
+    assert service._session._should_advance_session(session, service.playback_snapshot()) is True
 
 
 def test_session_worker_requires_two_ambiguous_stopped_snapshots_before_advancing(service) -> None:
@@ -409,14 +409,14 @@ def test_session_worker_requires_two_ambiguous_stopped_snapshots_before_advancin
     service._rpc.is_playing = False
     service._rpc.current_track["attributes"]["remainingTime"] = 0
     service._rpc.current_track["attributes"].pop("currentPlaybackTime", None)
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     playback = service.playback_snapshot()
 
-    assert service._should_advance_session(session, playback) is False
+    assert service._session._should_advance_session(session, playback) is False
     assert service._get_session_runtime(session["id"])["pending_stop_track_id"] == "catalog-track-favorite"
-    assert service._should_advance_session(session, playback) is True
+    assert service._session._should_advance_session(session, playback) is True
 
 
 def test_session_worker_requires_two_missing_track_stopped_snapshots_before_advancing(service) -> None:
@@ -426,14 +426,14 @@ def test_session_worker_requires_two_missing_track_stopped_snapshots_before_adva
 
     service._rpc.is_playing = False
     service._rpc.current_track = None
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     playback = service.playback_snapshot()
 
-    assert service._should_advance_session(session, playback) is False
+    assert service._session._should_advance_session(session, playback) is False
     assert service._get_session_runtime(session["id"])["pending_stop_track_id"] == "<missing>"
-    assert service._should_advance_session(session, playback) is True
+    assert service._session._should_advance_session(session, playback) is True
 
 
 def test_session_runtime_timestamps_are_utc_wall_clock_not_monotonic(service) -> None:
@@ -500,12 +500,12 @@ def test_pending_stop_confirmation_persists_across_process_restart(settings, ser
 
     rpc.is_playing = False
     rpc.current_track = None
-    first._set_session_runtime(session["id"], last_advance_at=0.0)
+    first._session._set_session_runtime(session["id"], last_advance_at=0.0)
     first._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     # The first process observes one stopped snapshot: it arms and PERSISTS the
     # pending confirmation, so it must not advance yet.
-    assert first._should_advance_session(session, first.playback_snapshot()) is False
+    assert first._session._should_advance_session(session, first.playback_snapshot()) is False
     assert first._preferences.get_session_runtime(session["id"])["pending_stop_track_id"] == "<missing>"
 
     # A fresh process on the same database must observe the armed confirmation
@@ -518,7 +518,7 @@ def test_pending_stop_confirmation_persists_across_process_restart(settings, ser
     )
     restarted_session = second._preferences.get_active_session()
     assert restarted_session is not None
-    assert second._should_advance_session(restarted_session, second.playback_snapshot()) is True
+    assert second._session._should_advance_session(restarted_session, second.playback_snapshot()) is True
 
 
 def test_preference_store_backfills_pending_stop_columns(tmp_path) -> None:
@@ -618,13 +618,13 @@ def test_session_worker_respects_persisted_cooldown_across_processes(settings, s
     session = second._preferences.get_active_session()
     assert session is not None
 
-    second._set_session_runtime(session["id"], last_advance_at=0.0)
+    second._session._set_session_runtime(session["id"], last_advance_at=0.0)
     first.next_track()
     rpc.is_playing = False
     rpc.current_track = None
 
     assert second._get_session_runtime(session["id"])["last_advance_at"] == 0.0
-    assert second._should_advance_session(session, second.playback_snapshot()) is False
+    assert second._session._should_advance_session(session, second.playback_snapshot()) is False
 
 
 def test_session_worker_respects_persisted_suspension_across_long_lived_processes(settings, service, tmp_path) -> None:
@@ -668,12 +668,12 @@ def test_session_worker_respects_persisted_suspension_across_long_lived_processe
     assert session is not None
 
     first.pause()
-    second._set_session_runtime(session["id"], suspended=False, last_advance_at=0.0)
+    second._session._set_session_runtime(session["id"], suspended=False, last_advance_at=0.0)
     rpc.is_playing = False
     rpc.current_track = None
 
     assert second._get_session_runtime(session["id"])["suspended"] is False
-    assert second._should_advance_session(session, second.playback_snapshot()) is False
+    assert second._session._should_advance_session(session, second.playback_snapshot()) is False
 
 
 def test_reject_current_track_advances_active_session_without_changing_vibe(service) -> None:
@@ -974,7 +974,7 @@ def test_new_query_pools_apply_global_recent_history_only_at_build_time(settings
     pool_service._rpc.current_track = None
 
     session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
-    built_pool = pool_service._build_session_query_pool(session, "Favorite Artist Liked Song")
+    built_pool = pool_service._session._build_session_query_pool(session, "Favorite Artist Liked Song")
     assert [entry["track"]["title"] for entry in built_pool["entries"]] == ["Liked Song"]
 
 
@@ -1031,7 +1031,7 @@ def test_new_query_pool_relaxes_global_recent_filter_when_it_would_be_empty(sett
     pool_service._rpc.current_track = None
 
     session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
-    built_pool = pool_service._build_session_query_pool(session, "Favorite Artist Liked Song")
+    built_pool = pool_service._session._build_session_query_pool(session, "Favorite Artist Liked Song")
 
     assert [entry["track"]["title"] for entry in built_pool["entries"]] == ["Liked Song"]
 
@@ -1060,8 +1060,8 @@ def test_materialized_session_queue_reuses_large_result_pool_without_requerying(
     service._resolver = QueueResolver()
     session = service._preferences.start_session(request_text="play upbeat music")
 
-    first = service._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
-    second = service._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+    first = service._session._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+    second = service._session._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
     queue = service.session_queue(limit=20, include_history=True)
 
     assert first["tracks"][0]["title"] == "Wide Song 1"
@@ -1333,7 +1333,7 @@ def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp
 
     active = debug_service._preferences.get_active_session()
     assert active is not None
-    debug_service._play_session_track_with_debug_episode(
+    debug_service._session._play_session_track_with_debug_episode(
         active,
         selection_strategy="adaptive-session-auto-advance",
         debug_reason="adaptive-session-auto-advance",
@@ -1384,14 +1384,14 @@ def test_auto_advance_debug_log_captures_decision_payload(settings, service, tmp
     debug_service._rpc.is_playing = False
     debug_service._rpc.current_track["attributes"]["remainingTime"] = 0
     debug_service._rpc.current_track["attributes"].pop("currentPlaybackTime", None)
-    debug_service._set_session_runtime(session["id"], last_advance_at=0.0)
+    debug_service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     debug_service._preferences.upsert_session_runtime(
         session["id"], last_advance_at="1970-01-01T00:00:00+00:00"
     )
 
     started = debug_service._begin_resolver_debug_episode("adaptive-session-auto-advance-check")
     try:
-        assert debug_service._should_advance_session(session, debug_service.playback_snapshot()) is False
+        assert debug_service._session._should_advance_session(session, debug_service.playback_snapshot()) is False
     finally:
         debug_service._end_resolver_debug_episode(started)
 
@@ -1512,7 +1512,7 @@ def test_top_pool_order_randomizes_within_small_high_confidence_bucket(service) 
             items.reverse()
 
     service._random = ReverseRandom()
-    ordered = service._top_pool_order(
+    ordered = service._search_ctrl._top_pool_order(
         [
             {"title": "One"},
             {"title": "Two"},
@@ -1828,7 +1828,7 @@ def test_best_track_match_accepts_title_variants(service) -> None:
         },
     ]
 
-    match = service._best_track_match(tracks, title="Sparkle (Piano Version)", artist="RADWIMPS")
+    match = service._search_ctrl._best_track_match(tracks, title="Sparkle (Piano Version)", artist="RADWIMPS")
 
     assert match is not None
     assert match["title"] == "Sparkle"
@@ -1914,7 +1914,7 @@ def test_paused_session_runtime_survives_restart(settings, service, tmp_path) ->
     session = restarted._preferences.get_active_session()
     assert session is not None
     assert restarted._get_session_runtime(session["id"])["suspended"] is True
-    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
+    assert restarted._session._should_advance_session(session, restarted.playback_snapshot()) is False
 
 
 def test_reconcile_preserves_current_playing_queue_item(settings, service, tmp_path) -> None:
@@ -2015,8 +2015,8 @@ def test_active_stopped_session_remains_eligible_after_restart(settings, service
     assert restarted._get_session_runtime(session["id"])["suspended"] is False
     assert restarted._preferences.get_session_runtime(session["id"])["active_intent"] == "active"
     # No current track is ambiguous: confirm across two stopped snapshots.
-    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
-    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is True
+    assert restarted._session._should_advance_session(session, restarted.playback_snapshot()) is False
+    assert restarted._session._should_advance_session(session, restarted.playback_snapshot()) is True
 
 
 def test_explicit_play_advances_stopped_active_session_after_restart(settings, service, tmp_path) -> None:
@@ -2069,7 +2069,7 @@ def test_explicit_play_advances_stopped_active_session_after_restart(settings, s
     assert result["status"] == "ok"
     assert restarted._get_session_runtime(session["id"])["suspended"] is False
     assert restarted.playback_snapshot()["is_playing"] is True
-    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
+    assert restarted._session._should_advance_session(session, restarted.playback_snapshot()) is False
 
 
 def test_reconcile_without_active_session_has_no_runtime(settings, service, tmp_path) -> None:
@@ -2126,8 +2126,8 @@ def test_session_events_distinguish_rejection_steering_skip_and_auto_advance(ser
     assert second_session is not None
     second_service._rpc.is_playing = False
     second_service._rpc.current_track = None
-    second_service._set_session_runtime(second_session["id"], last_advance_at=0.0)
-    second_service._play_session_track(second_session, selection_strategy="adaptive-session-auto-advance")
+    second_service._session._set_session_runtime(second_session["id"], last_advance_at=0.0)
+    second_service._session._play_session_track(second_session, selection_strategy="adaptive-session-auto-advance")
 
     event_types = [event["event_type"] for event in service._preferences.list_session_events(session["id"], limit=20)]
     event_types.extend(
@@ -2164,7 +2164,7 @@ def test_play_session_track_aborts_on_cancel_and_clears_advance_flag(service) ->
     service._session._worker_thread_ident = threading.get_ident()
     service._session._session_worker_stop.set()
     with pytest.raises(SessionWorkerCancelled):
-        service._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
+        service._session._play_session_track(session, selection_strategy="adaptive-session-auto-advance")
 
     assert service._get_session_runtime(session["id"])["advance_in_progress"] is False
 
@@ -2208,7 +2208,7 @@ def test_worker_exits_at_phase_boundary_on_cancel(service) -> None:
     # Make the worker want to advance: playback stopped + stale last advance.
     service._rpc.is_playing = False
     service._rpc.current_track = None
-    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     service._preferences.upsert_session_runtime(
         session["id"], last_advance_at="1970-01-01T00:00:00+00:00"
     )

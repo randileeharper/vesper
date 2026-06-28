@@ -237,7 +237,7 @@ class CiderAgentService:
             session = self._preferences.get_active_session()
             track = None
             if session is not None:
-                self._set_session_runtime(session["id"], suspended=False)
+                self._session._set_session_runtime(session["id"], suspended=False)
                 self._session._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
                 self._preferences.add_session_event(session["id"], event_type="session_resumed")
                 snapshot = self.playback_snapshot()
@@ -264,7 +264,7 @@ class CiderAgentService:
         with self.operation():
             session = self._preferences.get_active_session()
             if session is not None:
-                self._set_session_runtime(session["id"], suspended=True)
+                self._session._set_session_runtime(session["id"], suspended=True)
                 self._session._persist_session_runtime(session["id"], suspended=True, last_known_playback_state="paused")
                 self._preferences.add_session_event(session["id"], event_type="session_suspended")
             result = {"status": "ok", "result": self._rpc.playback_post("/pause")}
@@ -557,37 +557,8 @@ class CiderAgentService:
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._text_request_ctrl.run_action(action, parameters)
 
-    def _play_session_track_with_debug_episode(
-        self,
-        session: dict[str, Any],
-        *,
-        selection_strategy: str,
-        debug_reason: str,
-    ) -> dict[str, Any]:
-        return self._session._play_session_track_with_debug_episode(
-            session,
-            selection_strategy=selection_strategy,
-            debug_reason=debug_reason,
-        )
-
-    def _play_session_track(self, session: dict[str, Any], *, selection_strategy: str) -> dict[str, Any]:
-        return self._session._play_session_track(session, selection_strategy=selection_strategy)
-
-    def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
-        return self._session._normalize_session_search_update(value)
-
     def _sources_payload(self, sources: list[SessionSearchSource]) -> list[dict[str, str]]:
         return [{"kind": source.kind, "term": source.term} for source in sources]
-
-    def _next_session_search_sources(
-        self,
-        runtime: dict[str, Any],
-        search_update: dict[str, Any],
-    ) -> list[SessionSearchSource]:
-        return self._session._next_session_search_sources(runtime, search_update)
-
-    def _build_session_query_pool(self, session: dict[str, Any], source: SessionSearchSource) -> dict[str, Any]:
-        return self._session._build_session_query_pool(session, source)
 
     def _fetch_session_source_results(
         self,
@@ -595,13 +566,6 @@ class CiderAgentService:
         source: SessionSearchSource,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         return self._session._fetch_session_source_results(session, source)
-
-    def _ensure_session_query_pools(
-        self,
-        session: dict[str, Any],
-        search_sources: list[SessionSearchSource],
-    ) -> None:
-        self._session._ensure_session_query_pools(session, search_sources)
 
     def _begin_resolver_debug_episode(self, reason: str) -> bool:
         return self._resolver_debug.begin_episode(reason)
@@ -627,32 +591,14 @@ class CiderAgentService:
     def append_session_debug_log(self, *, stage: str, payload: dict[str, Any]) -> None:
         self._resolver_debug.append_session_log(stage=stage, payload=payload)
 
-    def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
-        return self._session._should_advance_session(session, playback)
-
     def _get_session_runtime(self, session_id: int) -> dict[str, Any]:
         return self._session._get_session_runtime(session_id)
-
-    def _set_session_runtime(self, session_id: int, **updates: Any) -> None:
-        self._session._set_session_runtime(session_id, **updates)
 
     def _extract_is_playing(self, payload: Any) -> bool | None:
         return _extract_is_playing(payload)
 
-    def _best_track_match(self, tracks: list[dict[str, Any]], *, title: str, artist: str) -> dict[str, Any] | None:
-        return self._search_ctrl._best_track_match(tracks, title=title, artist=artist)
-
     def _best_playlist_match(self, playlists: list[dict[str, Any]], *, playlist_name: str) -> dict[str, Any] | None:
         return self._search_ctrl._best_playlist_match(playlists, playlist_name=playlist_name)
-
-    def _top_pool_order(
-        self,
-        tracks: list[dict[str, Any]],
-        *,
-        take: int,
-        pool_size: int | None = None,
-    ) -> list[dict[str, Any]]:
-        return self._search_ctrl._top_pool_order(tracks, take=take, pool_size=pool_size)
 
     def _play_flattened_track(self, track: dict[str, Any], *, is_library_default: bool) -> dict[str, Any]:
         return self._search_ctrl._play_flattened_track(track, is_library_default=is_library_default)
