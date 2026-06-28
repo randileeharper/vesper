@@ -17,7 +17,7 @@ from .resolver import (
     build_resolver,
 )
 from .rpc import CiderRpcClient
-from .storage import PreferenceStore, close_connections
+from .storage import PreferenceStore, close_connections, close_lifecycle_locks
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
@@ -113,6 +113,9 @@ class CiderAgentService:
         # Release cached SQLite connections now that the background worker (the
         # only other thread that could touch the DB) has stopped. See #50.
         close_connections(self._settings.database_path)
+        # Drop the per-database lifecycle lock too; with the background
+        # session worker stopped there is no remaining holder. See #62.
+        close_lifecycle_locks(self._settings.database_path)
 
     @property
     def _session_worker_thread(self):

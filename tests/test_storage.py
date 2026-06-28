@@ -4,6 +4,7 @@ import sqlite3
 import threading
 
 from vesper.storage import PreferenceStore
+from vesper.storage import sessions as sessions_module
 
 
 def test_start_and_stop_session_toggles_active(settings) -> None:
@@ -99,3 +100,25 @@ def test_reset_stale_session_queue_items(settings) -> None:
     store.reset_stale_session_queue_items(session["id"])
 
     assert store.list_session_queue(session["id"])[0]["state"] == "queued"
+
+
+def test_close_lifecycle_locks_drops_entry_for_path(settings, tmp_path) -> None:
+    # start_session caches a lifecycle lock keyed by the database path; without
+    # cleanup the dict grows by one entry per test database (issue #62).
+    store = PreferenceStore(settings.database_path)
+    store.start_session(request_text="play some music")
+    key = settings.database_path
+    assert key in sessions_module._lifecycle_locks
+
+    sessions_module.close_lifecycle_locks(key)
+    assert key not in sessions_module._lifecycle_locks
+
+    # Scoping by a different path leaves the target lock untouched.
+    store.start_session(request_text="play some music")
+    other = tmp_path / "other.db"
+    sessions_module.close_lifecycle_locks(other)
+    assert key in sessions_module._lifecycle_locks
+
+    # Full teardown (used by the autouse conftest fixture) clears everything.
+    sessions_module.close_lifecycle_locks()
+    assert sessions_module._lifecycle_locks == {}

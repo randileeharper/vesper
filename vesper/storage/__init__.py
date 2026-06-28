@@ -13,6 +13,7 @@ from typing import Any
 
 from . import preferences, schema, session_data, session_queue, sessions
 from .schema import close_connections
+from .sessions import close_lifecycle_locks
 
 
 class PreferenceStore:
@@ -261,4 +262,4 @@ class PreferenceStore:
         )
 
 
-__all__ = ["PreferenceStore", "close_connections"]
+__all__ = ["PreferenceStore", "close_connections", "close_lifecycle_locks"]

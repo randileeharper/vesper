@@ -13,7 +13,7 @@ from vesper.config import Settings
 from vesper.rpc import CiderRpcClient
 from vesper.resolver import ResolvedAction, SessionQueryPlan, SessionSearchSource
 from vesper.service import CiderAgentService
-from vesper.storage import PreferenceStore, close_connections
+from vesper.storage import PreferenceStore, close_connections, close_lifecycle_locks
 
 
 class FakeResponse:
@@ -421,3 +421,4 @@ def _close_storage_connections() -> Any:
     """
     yield
     close_connections()
+    close_lifecycle_locks()

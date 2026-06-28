@@ -30,6 +30,25 @@ def _lifecycle_lock(database_path: Path) -> threading.Lock:
         return lock
 
 
+def close_lifecycle_locks(database_path: Path | None = None) -> None:
+    """Drop cached lifecycle locks, optionally scoped to one database file.
+
+    Mirrors :func:`vesper.storage.schema.close_connections`. With
+    *database_path*, removes only the lock cached for that file; without it,
+    removes every cached lock. Safe to call from any thread once no other
+    thread is mid-``start_session`` / ``stop_active_session`` for the affected
+    path(s) -- the same no-concurrent-use guarantee :func:`close_connections`
+    relies on. Used by :meth:`vesper.service.CiderAgentService.close` and by
+    test fixtures so the lock dict does not grow by one entry per test
+    database (issue #62).
+    """
+    with _lifecycle_locks_guard:
+        if database_path is None:
+            _lifecycle_locks.clear()
+        else:
+            _lifecycle_locks.pop(Path(database_path), None)
+
+
 def _decode_session_row(row: sqlite3.Row) -> dict[str, Any]:
     try:
         steering_history = json.loads(row["steering_history_json"])
