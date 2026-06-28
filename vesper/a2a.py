@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import uuid
 from contextlib import AsyncExitStack
@@ -10,7 +9,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
-import uvicorn
 from fastapi import FastAPI
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Struct
@@ -444,27 +442,3 @@ def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> 
 
 def create_a2a_app(*, include_mcp: bool = False) -> FastAPI:
     return create_http_app(include_a2a=True, include_mcp=include_mcp)
-
-
-def run_server(*, include_a2a: bool = False, include_mcp: bool = False) -> None:
-    settings = get_settings()
-    uvicorn.run(
-        create_http_app(include_a2a=include_a2a, include_mcp=include_mcp),
-        host=settings.http_host,
-        port=settings.http_port,
-        reload=False,
-    )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Vesper HTTP transports.")
-    parser.add_argument("--a2a", action="store_true", help="Enable the A2A HTTP transport.")
-    parser.add_argument("--mcp", action="store_true", help="Also mount the MCP Streamable HTTP transport at /mcp.")
-    args = parser.parse_args()
-    if not args.a2a and not args.mcp:
-        parser.error("At least one transport flag is required: --a2a and/or --mcp.")
-    run_server(include_a2a=args.a2a, include_mcp=args.mcp)
-
-
-if __name__ == "__main__":
-    main()

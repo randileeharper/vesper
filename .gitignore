@@ -27,6 +27,9 @@ config.json
 *.sqlite
 *.sqlite3
 
+# Local scratch and working files
+tmp/
+
 # Editor and OS noise
 .DS_Store
 .idea/
