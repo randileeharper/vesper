@@ -102,6 +102,53 @@ def test_reset_stale_session_queue_items(settings) -> None:
     assert store.list_session_queue(session["id"])[0]["state"] == "queued"
 
 
+def test_concurrent_claim_never_claims_same_item_twice(settings) -> None:
+    # Two concurrent callers racing to claim the next queued item must never
+    # both claim the same row. The conditional UPDATE (WHERE state = 'queued')
+    # plus rowcount check guarantees only one wins; the other retries and
+    # claims a different row (or returns None when nothing is left).
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play upbeat music")
+
+    store.replace_session_queue(
+        session["id"],
+        [
+            {
+                "source": {"kind": "legacy", "term": "wide"},
+                "source_key": "wide",
+                "track": {"id": f"track-{i}", "title": f"Title {i}"},
+            }
+            for i in range(20)
+        ],
+    )
+
+    claimed_ids: list[int] = []
+    lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            for _ in range(10):
+                item = store.claim_next_session_queue_item(session["id"])
+                if item is not None:
+                    with lock:
+                        claimed_ids.append(int(item["id"]))
+        except BaseException as exc:  # pragma: no cover - records any failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    # No item should appear in the claimed set more than once.
+    assert len(claimed_ids) == len(set(claimed_ids))
+    # All 20 queued items should have been claimed.
+    assert len(claimed_ids) == 20
+
+
 def test_close_lifecycle_locks_drops_entry_for_path(settings, tmp_path) -> None:
     # start_session caches a lifecycle lock keyed by the database path; without
     # cleanup the dict grows by one entry per test database (issue #62).

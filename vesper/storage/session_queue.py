@@ -11,6 +11,13 @@ from ..errors import PreferenceStoreError
 from .schema import connect
 
 
+# Upper bound on retry attempts when a queued row is taken by another caller
+# between the SELECT and the conditional UPDATE in claim_next_session_queue_item.
+# Each iteration re-reads the next available queued row, so this only retries
+# under genuine contention; the common uncontended path returns on attempt 1.
+_CLAIM_MAX_RETRIES = 8
+
+
 def replace_session_queue(
     database_path: Path,
     session_id: int,
@@ -161,46 +168,58 @@ def list_session_queue(
 def claim_next_session_queue_item(database_path: Path, session_id: int) -> dict[str, Any] | None:
     try:
         with connect(database_path) as connection:
-            row = connection.execute(
-                """
-                SELECT
-                    id,
-                    session_id,
-                    position,
-                    source_kind,
-                    source_term,
-                    source_key,
-                    track_id,
-                    title,
-                    artist,
-                    album,
-                    href,
-                    track_json,
-                    state,
-                    created_at,
-                    updated_at
-                FROM session_queue_items
-                WHERE session_id = ? AND state = 'queued'
-                ORDER BY position ASC, id ASC
-                LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            connection.execute(
-                """
-                UPDATE session_queue_items
-                SET state = 'playing', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (int(row["id"]),),
-            )
-            claimed = _decode_session_queue_row(row)
-            claimed["state"] = "playing"
+            # Claim atomically: UPDATE only if the row is still 'queued', then
+            # inspect rowcount. This closes a SELECT-then-UPDATE race where two
+            # concurrent callers (e.g. the background refill worker and a manual
+            # refill_active_session call) could both read the same 'queued' row
+            # before either updates it, claiming the same item twice. If the
+            # row is no longer queued (another caller won), retry the lookup a
+            # bounded number of times before concluding nothing is available.
+            for _ in range(_CLAIM_MAX_RETRIES):
+                row = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        session_id,
+                        position,
+                        source_kind,
+                        source_term,
+                        source_key,
+                        track_id,
+                        title,
+                        artist,
+                        album,
+                        href,
+                        track_json,
+                        state,
+                        created_at,
+                        updated_at
+                    FROM session_queue_items
+                    WHERE session_id = ? AND state = 'queued'
+                    ORDER BY position ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                cursor = connection.execute(
+                    """
+                    UPDATE session_queue_items
+                    SET state = 'playing', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND state = 'queued'
+                    """,
+                    (int(row["id"]),),
+                )
+                if cursor.rowcount == 1:
+                    claimed = _decode_session_queue_row(row)
+                    claimed["state"] = "playing"
+                    return claimed
+                # Another caller claimed this row between our SELECT and
+                # UPDATE; loop to try the next queued row.
+            return None
     except sqlite3.Error as exc:
         raise PreferenceStoreError(f"Could not claim next session queue item: {exc}") from exc
-    return claimed
 
 
 def get_session_queue_item(database_path: Path, queue_item_id: int) -> dict[str, Any] | None:
