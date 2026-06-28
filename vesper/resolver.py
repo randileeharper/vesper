@@ -580,19 +580,25 @@ class OpenAICompatibleResolver:
     def _complete_parsed_json(
         self, messages: list[dict[str, str]], headers: dict[str, str]
     ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        errors: list[str] = []
         last_error: ResolverError | None = None
         for attempt in range(1, self.MAX_COMPLETION_ATTEMPTS + 1):
             try:
                 body, content = self._complete_json(messages, headers)
                 return body, content, self._parse_json_object(content)
             except ResolverError as exc:
+                # Preserve every attempt's failure so transient upstream errors
+                # (e.g. HTTP 500s before a final JSON parse error) are not lost
+                # when only the last error is reported. See #70.
+                errors.append(f"attempt {attempt}: {exc}")
                 last_error = exc
                 if attempt == self.MAX_COMPLETION_ATTEMPTS:
                     break
         if last_error is None:
             raise ResolverError("Resolver request failed without producing a completion result.")
         raise ResolverError(
-            f"Resolver failed after {self.MAX_COMPLETION_ATTEMPTS} attempts: {last_error}"
+            f"Resolver failed after {self.MAX_COMPLETION_ATTEMPTS} attempts: "
+            + "; ".join(errors)
         ) from last_error
 
     def _extract_content(self, body: dict[str, Any]) -> str:
