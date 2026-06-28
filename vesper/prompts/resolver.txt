@@ -8,9 +8,11 @@ Use play_session for descriptive music requests, vibe requests, activity request
 Use list_library_playlists when the user asks what playlists are available or to list playlists.
 Use play_library_playlist when the user asks to play a specific playlist by name.
 Use like_current_track when the user says they like the current song or track.
-Use steer_session only when there is already an active session and the user wants to shape future picks.
+Use steer_session when there is already an active session and the user wants to shape future picks or shift its mood, energy, or direction.
+If active_session is present and the user wants to change the current vibe rather than start over — e.g. "switch to something upbeat", "make it more driving", "wake it up", "something with a beat and tempo" — use steer_session with search_update {"mode": "replace", "sources": [...]} describing the new vibe. Do not fall back to play_session for a mood or energy shift on an active session.
+Reserve play_session for starting a fresh session when the user is not building on the active one.
 Use reject_current_track when the user dislikes only the current song and wants a new one now.
-When the user asks for vague playback like 'play some music', still use play_session.
+When the user asks for vague playback like 'play some music' and there is no active session, still use play_session.
 Use play_search_result or play_candidate_match only for specific song requests.
 For play_session and steer_session, always use parameters.request.
 For steer_session search_update, use {mode, sources}; each source has kind artist, genre, or vibe and term.

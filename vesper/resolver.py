@@ -451,6 +451,7 @@ class OpenAICompatibleResolver:
             "session_steering": session.get("steering_history", [])[-5:],
             "search_source": {"kind": search_source.kind, "term": search_source.term},
             "candidates": candidates[:5],
+            "preferred_languages": self._preferred_languages(),
         }
         system = load_prompt("playlist_selection")
         return [
@@ -476,6 +477,14 @@ class OpenAICompatibleResolver:
             {"role": "system", "content": system},
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nReturn a new term."},
         ]
+
+    def _preferred_languages(self) -> list[str] | None:
+        # Surfaced to the session planner and playlist-selection prompts as a
+        # soft preference. An explicit per-request language override (e.g.
+        # "k-pop", "spanish pop") is handled in-prompt, not stripped here, so
+        # the model can honor the request over the default.
+        languages = self._settings.preferred_language
+        return list(languages) if languages else None
 
     def _normalize_search_sources(self, value: Any) -> list[SessionSearchSource]:
         if not isinstance(value, list):

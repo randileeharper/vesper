@@ -107,6 +107,21 @@ class Settings(BaseSettings):
     historian_retry_count: int = Field(default=2, ge=0)
     database_path: Path = Field(default=Path("~/.local/share/vesper/vesper.db").expanduser())
     config_path: Path | None = None
+    preferred_language: list[str] | None = None
+
+    @field_validator("preferred_language", mode="before")
+    @classmethod
+    def _normalize_preferred_language(cls, v: Any) -> Any:
+        # Accept None, a comma-separated string, or a list. Empty entries are
+        # dropped so a stray "" never becomes a phantom preferred language.
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            items = [item.strip() for item in v.split(",")]
+        else:
+            items = [str(item).strip() for item in v]
+        items = [item for item in items if item]
+        return items or None
 
     @field_validator("default_search_source", "response_detail", "log_level", "resolver_backend")
     @classmethod
@@ -256,4 +271,5 @@ class Settings(BaseSettings):
             "historian_retry_count": self.historian_retry_count,
             "database_path": str(self.database_path),
             "config_path": str(self.config_path) if self.config_path else None,
+            "preferred_language": self.preferred_language,
         }
