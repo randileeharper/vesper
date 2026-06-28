@@ -2,49 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from functools import wraps
-import logging
-import json
 import random
-import threading
-import time
 from typing import Any
 
 from .config import Settings
-from .historian import (
-    HistorianDeliveryError,
-    HistorianSink,
-    NullHistorianSink,
-    build_event,
-    current_operation,
-    operation_context,
-    replace_operation,
-    reset_operation,
-)
-from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
-from .catalog import (
-    catalog_relationship_tracks as _catalog_relationship_tracks_impl,
-    catalog_resource_search as _catalog_resource_search_impl,
-    flatten_track_item as _flatten_track_item,
-    get_library_playlist as _get_library_playlist_impl,
-    get_library_playlist_tracks as _get_library_playlist_tracks_impl,
-    list_library_playlists as _list_library_playlists_impl,
-    list_recently_played as _list_recently_played_impl,
-    load_genre_map as _load_genre_map_impl,
-    now_playing_info as _now_playing_info,
-    search_catalog as _search_catalog_impl,
-    search_library as _search_library_impl,
-    search_library_playlists as _search_library_playlists_impl,
-    search_library_tracks as _search_library_tracks_impl,
-)
-from .errors import (
-    CiderAgentError,
-    CiderValidationError,
-    PreferenceStoreError,
-    TextRequestExecutionError,
-)
+from .historian import HistorianSink
 from .results import EngineActionResult, TextRequestResult
 from .resolver import (
     ResolvedAction,
@@ -54,36 +18,19 @@ from .resolver import (
 )
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore, close_connections
-from .output import (
-    compact_resolved_action,
-    compact_track,
-    finalize_output,
-    summarize_execution,
-)
-from .matching import (
-    artist_track_score,
-    best_artist_track_match,
-    best_artist_track_matches,
-    best_playlist_match,
-    best_track_match,
-    top_pool_order,
-)
-from .validation import (
-    validate_index,
-    validate_limit_offset,
-    validate_playlist_id,
-    validate_search,
-)
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
-from .utils import _clean_id, _elapsed_ms
+from .utils import _clean_id, _extract_is_playing, _preference_target, _track_payload
 # :class:`vesper.session.SessionEngine` can be imported at module top now that
 # the session modules no longer import from ``vesper.service`` (issue #44).
 from .session import SessionEngine
-
-
-LOGGER = logging.getLogger(__name__)
+from .preference_controller import PreferenceController
+from .search_controller import SearchController
+from .playback_controller import PlaybackController
+from .text_request_controller import TextRequestController
+from .resolver_debug import ResolverDebugLogger
+from .events import EventEmitter
 
 
 def _historian_operation(method):
@@ -120,17 +67,16 @@ class CiderAgentService:
         historian_sink: HistorianSink | None = None,
     ) -> None:
         self._settings = settings
-        self._historian = historian_sink or NullHistorianSink()
+        self._events = EventEmitter(self, historian_sink)
+        self._historian = self._events.sink
         self._rpc = rpc_client or CiderRpcClient(settings, failure_callback=self._record_rpc_failure)
         set_failure_callback = getattr(self._rpc, "set_failure_callback", None)
         if callable(set_failure_callback):
             set_failure_callback(self._record_rpc_failure)
         self._preferences = preference_store or PreferenceStore(settings.database_path)
         self._resolver = resolver or build_resolver(settings)
-        self._resolver_debug_log_lock = threading.Lock()
-        self._resolver_debug_episode_depth = 0
+        self._resolver_debug = ResolverDebugLogger(self)
         self._random = random.SystemRandom()
-        self._genre_cache: dict[str, dict[str, str]] = {}
         # The adaptive-session engine owns the session runtime, the background
         # refill worker, and the search/planning/pool machinery.
         self._session = SessionEngine(
@@ -140,6 +86,11 @@ class CiderAgentService:
             resolver=self._resolver,
             settings=self._settings,
         )
+        self._preferences_ctrl = PreferenceController(self, preferences=self._preferences)
+        self._search_ctrl = SearchController(self, rpc=self._rpc)
+        self._playback_ctrl = PlaybackController(self, rpc=self._rpc, preferences=self._preferences, settings=self._settings)
+        self._text_request_ctrl = TextRequestController(self)
+        self._genre_cache = self._search_ctrl._genre_cache
         self.reconcile_session_runtime()
 
     @property
@@ -175,7 +126,7 @@ class CiderAgentService:
         causation_id: str | None = None,
         session_id: str | None = None,
     ):
-        return operation_context(
+        return self._events.operation(
             caller=caller,
             correlation_id=correlation_id,
             causation_id=causation_id,
@@ -191,113 +142,33 @@ class CiderAgentService:
         subject: str | None = None,
         session_id: int | str | None = None,
     ) -> str:
-        event = build_event(
-            event_type,
-            self._sanitize_event_data(data),
-            source=source,
-            subject=subject,
-            session_id=str(session_id) if session_id is not None else None,
+        return self._events.emit(
+            event_type, data, source=source, subject=subject, session_id=session_id
         )
-        try:
-            self._historian.emit(event)
-        except HistorianDeliveryError as exc:
-            # Historian delivery is best-effort: a failed delivery must never
-            # fail the surrounding operation. Only the documented delivery
-            # failure is swallowed (with a warning); unexpected sink failures
-            # propagate so they remain visible and actionable.
-            LOGGER.warning(
-                "Historian delivery failed for event_id=%s type=%s: %s",
-                event["id"],
-                event_type,
-                exc,
-            )
-        return str(event["id"])
 
     def _sanitize_event_data(self, value: Any) -> Any:
-        secrets = [
-            secret
-            for secret in (
-                self._settings.cider_api_token,
-                self._settings.resolver_api_key,
-                self._settings.historian_token,
-            )
-            if secret
-        ]
-        if isinstance(value, str):
-            sanitized = value
-            for secret in secrets:
-                sanitized = sanitized.replace(secret, "[REDACTED]")
-            return sanitized
-        if isinstance(value, dict):
-            return {str(key): self._sanitize_event_data(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._sanitize_event_data(item) for item in value]
-        if isinstance(value, tuple):
-            return [self._sanitize_event_data(item) for item in value]
-        return value
+        return self._events._sanitize_event_data(value)
 
     def _caller(self) -> str:
-        context = current_operation()
-        return context.caller if context is not None else "direct"
+        return self._events.caller()
 
     def _record_rpc_failure(self, failure: dict[str, Any]) -> None:
-        self._emit(
-            "music.rpc.failed",
-            {
-                "caller": self._caller(),
-                "operation": str(failure.get("operation", "")),
-                "status_code": failure.get("status_code"),
-                "error": str(failure.get("message", "")),
-            },
-            source="app://vesper/rpc",
-        )
+        self._events.record_rpc_failure(failure)
 
     def _record_error(self, component: str, operation: str | None, exc: Exception) -> None:
-        self._emit(
-            "core.operation.error",
-            {
-                "app_id": "vesper",
-                "component": component,
-                "error_type": exc.__class__.__name__,
-                "message": str(exc),
-                "operation": operation,
-                "details": {"caller": self._caller()},
-            },
-            source=f"app://vesper/{component}",
-        )
+        self._events.record_error(component, operation, exc)
 
     def _track_payload(self, track: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(track, dict):
-            return None
-        play_params = track.get("play_params", {}) if isinstance(track.get("play_params"), dict) else {}
-        track_id = (
-            _clean_id(track.get("track_id"))
-            or _clean_id(track.get("id"))
-            or _clean_id(play_params.get("id"))
-        )
-        if not track_id and not any(track.get(key) for key in ("title", "artist", "album")):
-            return None
-        return {
-            "id": track_id or None,
-            "title": track.get("title"),
-            "artist": track.get("artist"),
-            "album": track.get("album"),
-            "kind": track.get("kind") or track.get("type") or play_params.get("kind"),
-            "is_library": track.get("is_library")
-            if track.get("is_library") is not None
-            else play_params.get("is_library"),
-        }
+        return _track_payload(track)
 
     def _preference_target(self, preference: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(preference, dict):
-            return None
-        return {
-            "track_id": preference.get("track_id"),
-            "title": preference.get("title"),
-            "artist_id": preference.get("artist_id"),
-            "artist_name": preference.get("artist_name"),
-            "album": preference.get("album"),
-        }
+        return _preference_target(preference)
+
+    def _get_active_session(self) -> dict[str, Any] | None:
+        return self._preferences.get_active_session()
+
+    def _current_preference_context_query(self, runtime: dict[str, Any]) -> str | None:
+        return self._session._current_preference_context_query(runtime)
 
     def default_search_source(self) -> str:
         return self._settings.default_search_source
@@ -328,27 +199,9 @@ class CiderAgentService:
         return datetime.now(UTC).isoformat(timespec="seconds")
 
     def list_action_definitions(self, *, text_exposable_only: bool = False, public_only: bool = True) -> list[dict[str, Any]]:
-        definitions_source = (
-            list_public_action_definitions()
-            if public_only and not text_exposable_only
-            else list_action_definitions(text_exposable_only=text_exposable_only)
+        return self._text_request_ctrl.list_action_definitions(
+            text_exposable_only=text_exposable_only, public_only=public_only
         )
-        return [
-            {
-                "name": definition.name,
-                "description": definition.description,
-                "summary_label": definition.summary_label,
-                "parameter_schema": definition.parameter_schema,
-                "required_fields": list(definition.required_fields),
-                "read_only": definition.read_only,
-                "text_exposable": definition.text_exposable,
-                "public_exposed": definition.public_exposed,
-                "session_aware": definition.session_aware,
-                "deferred_a2a_eligible": definition.deferred_a2a_eligible,
-                "advanced_only": definition.advanced_only,
-            }
-            for definition in definitions_source
-        ]
 
     def reconcile_session_runtime(self) -> None:
         self._session.reconcile_session_runtime()
@@ -360,106 +213,16 @@ class CiderAgentService:
         self._session.stop_background_session_worker(timeout=timeout)
 
     def status(self) -> dict[str, Any]:
-        playback = self.playback_snapshot()
-        payload = {
-            "status": "ok",
-            "source": "vesper",
-            "config": self._settings.sanitized(),
-            "playback": playback,
-            "preferences_count": len(self._preferences.list_preferences()),
-        }
-        if self.response_detail() == "compact":
-            queue = playback.get("queue", {})
-            session = self._preferences.get_active_session()
-            return {
-                "status": "ok",
-                "source": "vesper",
-                "playback": {
-                    "is_playing": playback.get("is_playing"),
-                    "track": compact_track(playback.get("track", {})),
-                    "volume": playback.get("volume"),
-                    "queue_length": queue.get("count", 0) if isinstance(queue, dict) else 0,
-                },
-                "queue": {
-                    "count": queue.get("count", 0) if isinstance(queue, dict) else 0,
-                    "tracks": [
-                        compact_track(item["track"])
-                        for item in (queue.get("items", []) if isinstance(queue, dict) else [])[:5]
-                        if isinstance(item, dict) and isinstance(item.get("track"), dict)
-                    ],
-                },
-                "session": {
-                    "id": session.get("id"),
-                    "is_active": session.get("is_active"),
-                    "mode": session.get("mode"),
-                }
-                if isinstance(session, dict)
-                else None,
-                "preferences_count": payload["preferences_count"],
-            }
-        return payload
+        return self._playback_ctrl.status()
 
     def get_now_playing(self) -> dict[str, Any]:
-        payload = self._rpc.playback_get("/now-playing")
-        info = _now_playing_info(payload)
-        return {
-            "status": "ok",
-            "source": "cider-rpc",
-            "track": _flatten_track_item({"attributes": info}),
-            "raw": payload,
-        }
+        return self._playback_ctrl.get_now_playing()
 
     def playback_snapshot(self) -> dict[str, Any]:
-        snapshot_paths = {
-            "is_playing": "/is-playing",
-            "now_playing": "/now-playing",
-            "volume": "/volume",
-            "queue": "/queue",
-            "repeat": "/repeat-mode",
-            "shuffle": "/shuffle-mode",
-            "autoplay": "/autoplay",
-        }
-        with ThreadPoolExecutor(max_workers=len(snapshot_paths)) as executor:
-            payloads = {
-                name: future.result()
-                for name, future in {
-                    name: executor.submit(self._rpc.playback_get, path) for name, path in snapshot_paths.items()
-                }.items()
-            }
-        is_playing_payload = payloads["is_playing"]
-        now_playing_payload = payloads["now_playing"]
-        volume_payload = payloads["volume"]
-        queue_payload = payloads["queue"]
-        repeat_payload = payloads["repeat"]
-        shuffle_payload = payloads["shuffle"]
-        autoplay_payload = payloads["autoplay"]
-        info = _now_playing_info(now_playing_payload)
-        queue = self._queue_result(queue_payload)
-        return {
-            "status": "ok",
-            "source": "cider-rpc",
-            "is_playing": self._extract_is_playing(is_playing_payload),
-            "track": {
-                "title": info.get("name"),
-                "artist": info.get("artistName"),
-                "album": info.get("albumName"),
-                "track_id": info.get("playParams", {}).get("id"),
-                "kind": info.get("playParams", {}).get("kind"),
-                "is_library": info.get("playParams", {}).get("isLibrary"),
-                "current_playback_time": info.get("currentPlaybackTime"),
-                "remaining_time": info.get("remainingTime"),
-                "duration_millis": info.get("durationInMillis"),
-            },
-            "volume": volume_payload.get("volume") if isinstance(volume_payload, dict) else None,
-            "repeat_mode": repeat_payload.get("value") if isinstance(repeat_payload, dict) else None,
-            "shuffle_mode": shuffle_payload.get("value") if isinstance(shuffle_payload, dict) else None,
-            "autoplay": autoplay_payload.get("value") if isinstance(autoplay_payload, dict) else None,
-            "queue_length": queue["count"],
-            "queue": queue,
-        }
+        return self._playback_ctrl.playback_snapshot()
 
     def is_playing(self) -> dict[str, Any]:
-        return {"status": "ok", "is_playing": self._extract_is_playing(self._rpc.playback_get("/is-playing"))}
+        return self._playback_ctrl.is_playing()
 
     @_historian_operation
     def play(self) -> dict[str, Any]:
@@ -507,7 +270,7 @@ class CiderAgentService:
             return result
 
     def playpause(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/playpause")}
+        return self._playback_ctrl.playpause()
 
     @_historian_operation
     def stop(self) -> dict[str, Any]:
@@ -571,80 +334,52 @@ class CiderAgentService:
             return result
 
     def get_volume(self) -> dict[str, Any]:
-        return {"status": "ok", "volume": self._rpc.playback_get("/volume")}
+        return self._playback_ctrl.get_volume()
 
     def set_volume(self, volume: int) -> dict[str, Any]:
-        if volume < 0 or volume > 100:
-            raise CiderValidationError("volume must be between 0 and 100.")
-        normalized_volume = volume / 100.0
-        return {
-            "status": "ok",
-            "requested_volume": volume,
-            "normalized_volume": normalized_volume,
-            "result": self._rpc.playback_post("/volume", {"volume": normalized_volume}),
-        }
+        return self._playback_ctrl.set_volume(volume)
 
     def get_repeat_mode(self) -> dict[str, Any]:
-        return {"status": "ok", "repeat_mode": self._rpc.playback_get("/repeat-mode")}
+        return self._playback_ctrl.get_repeat_mode()
 
     def toggle_repeat(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/toggle-repeat")}
+        return self._playback_ctrl.toggle_repeat()
 
     def get_shuffle_mode(self) -> dict[str, Any]:
-        return {"status": "ok", "shuffle_mode": self._rpc.playback_get("/shuffle-mode")}
+        return self._playback_ctrl.get_shuffle_mode()
 
     def toggle_shuffle(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/toggle-shuffle")}
+        return self._playback_ctrl.toggle_shuffle()
 
     def get_autoplay(self) -> dict[str, Any]:
-        return {"status": "ok", "autoplay": self._rpc.playback_get("/autoplay")}
+        return self._playback_ctrl.get_autoplay()
 
     def toggle_autoplay(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/toggle-autoplay")}
+        return self._playback_ctrl.toggle_autoplay()
 
     def get_queue(self) -> dict[str, Any]:
-        return self._queue_result(self._rpc.playback_get("/queue"))
+        return self._playback_ctrl.get_queue()
 
     def _queue_result(self, payload: Any) -> dict[str, Any]:
-        items = payload if isinstance(payload, list) else []
-        return {
-            "status": "ok",
-            "count": len(items),
-            "items": [
-                {
-                    "index": index,
-                    "track": _flatten_track_item(item),
-                }
-                for index, item in enumerate(items)
-            ],
-            "raw": payload,
-        }
+        return self._playback_ctrl._queue_result(payload)
 
     def play_next(self, item: dict[str, Any]) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/play-next", item)}
+        return self._playback_ctrl.play_next(item)
 
     def play_later(self, item: dict[str, Any]) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/play-later", item)}
+        return self._playback_ctrl.play_later(item)
 
     def move_queue_item(self, from_index: int, to_index: int) -> dict[str, Any]:
-        validate_index(from_index, "from_index")
-        validate_index(to_index, "to_index")
-        return {
-            "status": "ok",
-            "result": self._rpc.playback_post("/queue/move-to-position", {"fromIndex": from_index, "toIndex": to_index}),
-        }
+        return self._playback_ctrl.move_queue_item(from_index, to_index)
 
     def remove_queue_item(self, index: int) -> dict[str, Any]:
-        validate_index(index, "index")
-        return {"status": "ok", "result": self._rpc.playback_post("/queue/remove-by-index", {"index": index})}
+        return self._playback_ctrl.remove_queue_item(index)
 
     def clear_queue(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/queue/clear-queue")}
+        return self._playback_ctrl.clear_queue()
 
     def play_url(self, url: str) -> dict[str, Any]:
-        if not url.strip():
-            raise CiderValidationError("url cannot be empty.")
-        return {"status": "ok", "result": self._rpc.playback_post("/play-url", {"url": url})}
+        return self._playback_ctrl.play_url(url)
 
     @_historian_operation
     def play_item(
@@ -655,40 +390,16 @@ class CiderAgentService:
         is_library: bool = False,
         track: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not item_id.strip():
-            raise CiderValidationError("item_id cannot be empty.")
-        body = {"id": item_id, "type": kind, "isLibrary": is_library}
-        result = {"status": "ok", "result": self._rpc.playback_post("/play-item", body)}
-        track_payload = self._track_payload(track) or {}
-        track_payload.update({"id": item_id, "kind": kind, "is_library": is_library})
-        track_payload.setdefault("title", None)
-        track_payload.setdefault("artist", None)
-        track_payload.setdefault("album", None)
-        self._emit(
-            "music.playback.started",
-            {
-                "caller": self._caller(),
-                "action": "play_item",
-                "track": track_payload,
-            },
-            source="app://vesper/playback",
-            subject=item_id,
-        )
-        return result
+        return self._playback_ctrl.play_item(item_id, kind=kind, is_library=is_library, track=track)
 
     def play_item_href(self, href: str) -> dict[str, Any]:
-        if not href.strip():
-            raise CiderValidationError("href cannot be empty.")
-        return {"status": "ok", "result": self._rpc.playback_post("/play-item-href", {"href": href})}
+        return self._playback_ctrl.play_item_href(href)
 
     def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
-        validate_limit_offset(limit, offset)
-        if not query.strip():
-            raise CiderValidationError("query cannot be empty.")
-        return _search_catalog_impl(self._rpc, query, limit=limit, storefront=storefront, offset=offset)
+        return self._search_ctrl.search_catalog(query, limit=limit, storefront=storefront, offset=offset)
 
     def search_catalog_tracks(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
-        return self.search_catalog(query, limit=limit, storefront=storefront, offset=offset)
+        return self._search_ctrl.search_catalog_tracks(query, limit=limit, storefront=storefront, offset=offset)
 
     def _catalog_resource_search(
         self,
@@ -698,7 +409,7 @@ class CiderAgentService:
         limit: int = 5,
         storefront: str = SESSION_STOREFRONT,
     ) -> list[dict[str, Any]]:
-        return _catalog_resource_search_impl(self._rpc, query, resource_type=resource_type, limit=limit, storefront=storefront)
+        return self._search_ctrl._catalog_resource_search(query, resource_type=resource_type, limit=limit, storefront=storefront)
 
     def _catalog_relationship_tracks(
         self,
@@ -706,76 +417,48 @@ class CiderAgentService:
         *,
         storefront: str = SESSION_STOREFRONT,
     ) -> list[dict[str, Any]]:
-        return _catalog_relationship_tracks_impl(
-            self._rpc, path, result_limit=self.SESSION_SEARCH_RESULT_LIMIT, page_limit=self.SESSION_SEARCH_PAGE_LIMIT, storefront=storefront
+        return self._search_ctrl._catalog_relationship_tracks(
+            path,
+            result_limit=self.SESSION_SEARCH_RESULT_LIMIT,
+            page_limit=self.SESSION_SEARCH_PAGE_LIMIT,
+            storefront=storefront,
         )
 
     def _load_genre_map(self, storefront: str = SESSION_STOREFRONT) -> dict[str, str]:
-        return _load_genre_map_impl(self._rpc, self._genre_cache, storefront=storefront)
+        return self._search_ctrl._load_genre_map(storefront=storefront)
 
     def session_genre_names(self) -> list[str]:
-        return list(self._load_genre_map(self.SESSION_STOREFRONT))
+        return self._search_ctrl.session_genre_names(storefront=self.SESSION_STOREFRONT)
 
     def session_rejected_search_sources(self, session: dict[str, Any]) -> list[dict[str, str]]:
         return self._session.session_rejected_search_sources(session)
 
     def search(self, query: str, *, limit: int = 10, storefront: str = "us") -> dict[str, Any]:
-        if self.default_search_source() == "library":
-            result = self.search_library(query, limit=limit)
-        else:
-            result = self.search_catalog(query, limit=limit, storefront=storefront)
-        result["search_source"] = self.default_search_source()
-        return result
+        return self._search_ctrl.search(query, limit=limit, storefront=storefront)
 
     def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None) -> dict[str, Any]:
-        validate_search(query, limit)
-        return _search_library_impl(self._rpc, query, limit=limit, types=types)
+        return self._search_ctrl.search_library(query, limit=limit, types=types)
 
     def search_library_tracks(self, query: str, *, limit: int = 10) -> dict[str, Any]:
-        validate_search(query, limit)
-        return _search_library_tracks_impl(self._rpc, query, limit=limit)
+        return self._search_ctrl.search_library_tracks(query, limit=limit)
 
     def list_library_playlists(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
-        validate_limit_offset(limit, offset)
-        return _list_library_playlists_impl(self._rpc, limit=limit, offset=offset)
+        return self._search_ctrl.list_library_playlists(limit=limit, offset=offset)
 
     def search_library_playlists(self, query: str, *, limit: int = 10) -> dict[str, Any]:
-        validate_search(query, limit)
-        return _search_library_playlists_impl(self._rpc, query, limit=limit)
+        return self._search_ctrl.search_library_playlists(query, limit=limit)
 
     def get_library_playlist(self, playlist_id: str) -> dict[str, Any]:
-        validate_playlist_id(playlist_id)
-        return _get_library_playlist_impl(self._rpc, playlist_id)
+        return self._search_ctrl.get_library_playlist(playlist_id)
 
     def get_library_playlist_tracks(self, playlist_id: str, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
-        validate_playlist_id(playlist_id)
-        validate_limit_offset(limit, offset)
-        return _get_library_playlist_tracks_impl(self._rpc, playlist_id, limit=limit, offset=offset)
+        return self._search_ctrl.get_library_playlist_tracks(playlist_id, limit=limit, offset=offset)
 
     def play_library_playlist(self, playlist_name: str) -> dict[str, Any]:
-        if not playlist_name.strip():
-            raise CiderValidationError("playlist_name cannot be empty.")
-        exact_results = self.search_library_playlists(playlist_name, limit=10)
-        playlists = list(exact_results.get("playlists", []))
-        if not playlists:
-            playlists = list(self.list_library_playlists(limit=50).get("playlists", []))
-        match = self._best_playlist_match(playlists, playlist_name=playlist_name)
-        if match is None:
-            raise CiderValidationError(f"No library playlist matched: {playlist_name}")
-        playlist_id = str(match.get("id", "")).strip()
-        playlist_type = str(match.get("type", "library-playlists")).strip() or "library-playlists"
-        if not playlist_id:
-            raise CiderValidationError("Matched playlist did not include a playable id.")
-        playback = self.play_item(playlist_id, kind=playlist_type, is_library=True)
-        return {
-            "status": "ok",
-            "playlist": match,
-            "playback": playback,
-        }
+        return self._search_ctrl.play_library_playlist(playlist_name)
 
     def list_recently_played(self, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
-        validate_limit_offset(limit, offset)
-        return _list_recently_played_impl(self._rpc, limit=limit, offset=offset)
+        return self._search_ctrl.list_recently_played(limit=limit, offset=offset)
 
     def play_search_result(
         self,
@@ -785,147 +468,18 @@ class CiderAgentService:
         index: int = 0,
         storefront: str = "us",
     ) -> dict[str, Any]:
-        validate_search(query, 25)
-        validate_index(index, "index")
-        if source == "library":
-            results = self.search_library_tracks(query, limit=25)
-            items = results["tracks"]
-        elif source == "catalog":
-            results = self.search_catalog_tracks(query, limit=25, storefront=storefront)
-            items = results["tracks"]
-        elif source == "default":
-            resolved_source = self.default_search_source()
-            return self.play_search_result(query=query, source=resolved_source, index=index, storefront=storefront)
-        else:
-            raise CiderValidationError("source must be 'library', 'catalog', or 'default'.")
-        if index >= len(items):
-            raise CiderValidationError("Search result index was out of range.")
-        return self._play_flattened_track(items[index], is_library_default=source == "library")
+        return self._search_ctrl.play_search_result(query=query, source=source, index=index, storefront=storefront)
 
     def list_preferences(self) -> dict[str, Any]:
-        preferences = self._preferences.list_preferences()
-        liked_tracks = [item for item in preferences if item.get("preference_type") == "liked_track"]
-        favored_artists = [item for item in preferences if item.get("preference_type") == "favored_artist"]
-        rejected_tracks = [item for item in preferences if item.get("preference_type") == "globally_rejected_track"]
-        return {
-            "status": "ok",
-            "count": len(preferences),
-            "summary": {
-                "liked_tracks": len(liked_tracks),
-                "favored_artists": len(favored_artists),
-                "globally_rejected_tracks": len(rejected_tracks),
-            },
-            "liked_tracks": liked_tracks,
-            "favored_artists": favored_artists,
-            "globally_rejected_tracks": rejected_tracks,
-            "preferences": preferences,
-        }
+        return self._preferences_ctrl.list_preferences()
 
     @_historian_operation
     def forget_preference(self, preference_id: int) -> dict[str, Any]:
-        preference = None
-        try:
-            preference = self._preferences.get_preference(preference_id)
-        except PreferenceStoreError:
-            # ``get_preference`` raises this when the row is missing. We treat
-            # a missing preference as already forgotten (idempotent delete)
-            # and fall through to the delete below, which surfaces a clean
-            # CiderValidationError if the row truly is gone. Unexpected errors
-            # are not caught so they propagate.
-            pass
-        removed = self._preferences.delete_preference(preference_id)
-        if not removed:
-            raise CiderValidationError(f"Preference {preference_id} was not found.")
-        self._emit(
-            "music.preference.forgotten",
-            {
-                "caller": self._caller(),
-                "preference_id": preference_id,
-                "preference_type": preference.get("preference_type") if preference else None,
-                "target": self._preference_target(preference),
-            },
-            source="app://vesper/preferences",
-            subject=str(preference_id),
-        )
-        return {"status": "ok", "removed": True, "preference_id": preference_id}
+        return self._preferences_ctrl.forget_preference(preference_id)
 
     @_historian_operation
     def like_current_track(self) -> dict[str, Any]:
-        playback = self.playback_snapshot()
-        current = playback.get("track", {})
-        current_id = _clean_id(current.get("track_id"))
-        if not current_id:
-            raise CiderValidationError("No current track is available to like.")
-        session = self._preferences.get_active_session()
-        runtime = self._get_session_runtime(session["id"]) if session is not None else {}
-        liked_track = self._preferences.record_liked_track(
-            track_id=current_id,
-            title=str(current.get("title", "")).strip() or None,
-            artist_name=str(current.get("artist", "")).strip() or None,
-            album=str(current.get("album", "")).strip() or None,
-            item_kind=str(current.get("kind", "")).strip() or None,
-            is_library=bool(current.get("is_library")) if current.get("is_library") is not None else None,
-            session_request_text=str(session.get("request_text", "")).strip() or None if session is not None else None,
-            session_search_query=self._session._current_preference_context_query(runtime),
-        )
-        favored_artist = None
-        if str(current.get("artist", "")).strip():
-            favored_artist = self._preferences.record_favored_artist(
-                artist_name=str(current.get("artist", "")).strip(),
-                session_request_text=liked_track.get("session_request_text"),
-                session_search_query=liked_track.get("session_search_query"),
-            )
-        if session is not None:
-            self._preferences.add_session_event(
-                session["id"],
-                event_type="track_liked",
-                track={
-                    "track_id": current_id,
-                    "title": current.get("title"),
-                    "artist": current.get("artist"),
-                    "album": current.get("album"),
-                    "href": None,
-                },
-                metadata={
-                    "session_request_text": liked_track.get("session_request_text"),
-                    "session_search_query": liked_track.get("session_search_query"),
-                },
-            )
-        self._emit(
-            "music.preference.recorded",
-            {
-                "caller": self._caller(),
-                "preference_id": liked_track["id"],
-                "preference_type": liked_track["preference_type"],
-                "polarity": "like",
-                "target": self._preference_target(liked_track),
-                "reason": None,
-            },
-            source="app://vesper/preferences",
-            subject=str(liked_track["id"]),
-            session_id=session["id"] if session else None,
-        )
-        if favored_artist is not None:
-            self._emit(
-                "music.preference.recorded",
-                {
-                    "caller": self._caller(),
-                    "preference_id": favored_artist["id"],
-                    "preference_type": favored_artist["preference_type"],
-                    "polarity": "prefer",
-                    "target": self._preference_target(favored_artist),
-                    "reason": "artist of liked track",
-                },
-                source="app://vesper/preferences",
-                subject=str(favored_artist["id"]),
-                session_id=session["id"] if session else None,
-            )
-        return {
-            "status": "ok",
-            "playback_continues": True,
-            "liked_track": liked_track,
-            "favored_artist": favored_artist,
-        }
+        return self._preferences_ctrl.like_current_track()
 
     def session_status(self, *, include_recent_tracks: bool = True, compact: bool | None = None) -> dict[str, Any]:
         return self._session.session_status(include_recent_tracks=include_recent_tracks, compact=compact)
@@ -972,139 +526,29 @@ class CiderAgentService:
         candidate_queries: list[str] | None = None,
         storefront: str = "us",
     ) -> dict[str, Any]:
-        track_candidates = candidate_tracks or []
-        query_candidates = candidate_queries or []
-
-        for candidate in track_candidates:
-            title = str(candidate.get("title", "")).strip()
-            artist = str(candidate.get("artist", "")).strip()
-            if not title or not artist:
-                continue
-            search = self.search_catalog_tracks(f"{artist} {title}", limit=10, storefront=storefront)
-            match = self._best_track_match(search["tracks"], title=title, artist=artist)
-            if match is not None:
-                playback = self._play_flattened_track(match, is_library_default=False)
-                return {
-                    "status": "ok",
-                    "selection_strategy": "candidate_track_exactish_match",
-                    "selected_track": match,
-                    "playback": playback,
-                }
-
-        for query in query_candidates:
-            query_text = str(query).strip()
-            if not query_text:
-                continue
-            try:
-                result = self._play_search_result_from_pool(query=query_text, source="default", storefront=storefront)
-            except CiderAgentError:
-                continue
-            return {
-                "status": "ok",
-                "selection_strategy": "candidate_query_fallback",
-                "selected_query": query_text,
-                "playback": result,
-            }
-
-        raise CiderValidationError("No playable candidate match could be resolved.")
+        return self._search_ctrl.play_candidate_match(
+            candidate_tracks=candidate_tracks,
+            candidate_queries=candidate_queries,
+            storefront=storefront,
+        )
 
     def resolve_text_request(self, text: str) -> ResolvedAction:
-        return self._resolver.resolve(text, self)
+        return self._text_request_ctrl.resolve_text_request(text)
 
     def execute_text_request(self, text: str) -> TextRequestResult:
-        with self.operation():
-            request_event_id = self._emit(
-                "music.request.received",
-                {
-                    "caller": self._caller(),
-                    "request": text,
-                    "resolved_action": None,
-                },
-                source="app://vesper/request",
-            )
-            operation_token = replace_operation(causation_id=request_event_id)
-            try:
-                return self._execute_text_request(text)
-            finally:
-                reset_operation(operation_token)
+        return self._text_request_ctrl.execute_text_request(text)
 
     def _execute_text_request(self, text: str) -> TextRequestResult:
-        try:
-            started_debug_episode = self._begin_resolver_debug_episode(f"text-request: {text.strip()}")
-            started_at = time.perf_counter()
-            resolve_started_at = time.perf_counter()
-            resolved = self.resolve_text_request(text)
-            resolve_ms = _elapsed_ms(resolve_started_at)
-            resolved_action = compact_resolved_action(resolved.action, resolved.parameters, self.response_detail())
-            execute_started_at = time.perf_counter()
-            try:
-                execution = self.execute_action(resolved.action, resolved.parameters)
-            except CiderAgentError as exc:
-                self._record_error("service", resolved.action, exc)
-                error = {"type": exc.__class__.__name__, "message": str(exc)}
-                timings = None
-                if self.include_timing_debug():
-                    timings = {
-                        "resolve_ms": resolve_ms,
-                        "execute_ms": _elapsed_ms(execute_started_at),
-                        "total_ms": _elapsed_ms(started_at),
-                    }
-                failure = TextRequestResult(
-                    status="error",
-                    input=text,
-                    resolver=resolved.resolver,
-                    resolved_action=resolved_action,
-                    execution=EngineActionResult(action=resolved.action, result={}),
-                    reasoning=resolved.reasoning,
-                    resolver_raw_content=resolved.raw_content,
-                    resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
-                    timings=timings,
-                    error=error,
-                )
-                raise TextRequestExecutionError(str(exc), failure.as_dict()) from exc
-            summary = summarize_execution(execution.as_dict())
-            timings = None
-            if self.include_timing_debug():
-                timings = {
-                    "resolve_ms": resolve_ms,
-                    "execute_ms": _elapsed_ms(execute_started_at),
-                    "total_ms": _elapsed_ms(started_at),
-                }
-            return TextRequestResult(
-                input=text,
-                resolver=resolved.resolver,
-                resolved_action=resolved_action,
-                execution=execution,
-                summary=summary,
-                reasoning=resolved.reasoning,
-                resolver_raw_content=resolved.raw_content,
-                resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
-                timings=timings,
-            )
-        except CiderAgentError as exc:
-            if not isinstance(exc, TextRequestExecutionError):
-                self._record_error("resolver", "resolve_text_request", exc)
-            raise
-        finally:
-            self._end_resolver_debug_episode(locals().get("started_debug_episode", False))
+        return self._text_request_ctrl._execute_text_request(text)
 
     def handle_text_request(self, text: str) -> dict[str, Any]:
-        return self.execute_text_request(text).as_dict()
+        return self._text_request_ctrl.handle_text_request(text)
 
     def execute_action(self, action: str, parameters: dict[str, Any] | None = None) -> EngineActionResult:
-        params = parameters or {}
-        definition = get_action_definition(action)
-        if definition is None:
-            raise CiderValidationError(f"Unsupported action: {action}")
-        try:
-            result = definition.executor(self, params)
-        except (KeyError, TypeError, ValueError) as exc:
-            self._record_error("service", action, exc)
-            raise CiderValidationError(f"Invalid parameters for action {action}: {exc}") from exc
-        return EngineActionResult(action=action, result=finalize_output(result, self.response_detail(), self.include_timing_debug()))
+        return self._text_request_ctrl.execute_action(action, parameters)
 
     def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.execute_action(action, parameters).as_dict()
+        return self._text_request_ctrl.run_action(action, parameters)
 
     def _play_session_track_with_debug_episode(
         self,
@@ -1153,24 +597,10 @@ class CiderAgentService:
         self._session._ensure_session_query_pools(session, search_sources)
 
     def _begin_resolver_debug_episode(self, reason: str) -> bool:
-        path = self.resolver_debug_log_path()
-        if path is None:
-            return False
-        with self._resolver_debug_log_lock:
-            if self._resolver_debug_episode_depth == 0:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    f"timestamp: {self.current_timestamp()}\nreason: {reason}\n\n",
-                    encoding="utf-8",
-                )
-            self._resolver_debug_episode_depth += 1
-            return True
+        return self._resolver_debug.begin_episode(reason)
 
     def _end_resolver_debug_episode(self, started: bool) -> None:
-        if not started:
-            return
-        with self._resolver_debug_log_lock:
-            self._resolver_debug_episode_depth = max(0, self._resolver_debug_episode_depth - 1)
+        self._resolver_debug.end_episode(started)
 
     def append_resolver_debug_log(
         self,
@@ -1180,42 +610,15 @@ class CiderAgentService:
         response_body: dict[str, Any],
         response_content: str,
     ) -> None:
-        path = self.resolver_debug_log_path()
-        if path is None:
-            return
-        entry = (
-            f"=== {stage} ===\n"
-            f"timestamp: {self.current_timestamp()}\n"
-            "messages:\n"
-            f"{json.dumps(messages, ensure_ascii=False, indent=2)}\n\n"
-            "response_body:\n"
-            f"{json.dumps(response_body, ensure_ascii=False, indent=2)}\n\n"
-            "response_content:\n"
-            f"{response_content}\n\n"
+        self._resolver_debug.append_resolver_log(
+            stage=stage,
+            messages=messages,
+            response_body=response_body,
+            response_content=response_content,
         )
-        with self._resolver_debug_log_lock:
-            if self._resolver_debug_episode_depth <= 0:
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(entry)
 
     def append_session_debug_log(self, *, stage: str, payload: dict[str, Any]) -> None:
-        path = self.resolver_debug_log_path()
-        if path is None:
-            return
-        entry = (
-            f"=== {stage} ===\n"
-            f"timestamp: {self.current_timestamp()}\n"
-            "payload:\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        )
-        with self._resolver_debug_log_lock:
-            if self._resolver_debug_episode_depth <= 0:
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(entry)
+        self._resolver_debug.append_session_log(stage=stage, payload=payload)
 
     def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
         return self._session._should_advance_session(session, playback)
@@ -1227,29 +630,13 @@ class CiderAgentService:
         self._session._set_session_runtime(session_id, **updates)
 
     def _extract_is_playing(self, payload: Any) -> bool | None:
-        if isinstance(payload, bool):
-            return payload
-        if isinstance(payload, dict):
-            if "value" in payload:
-                return bool(payload["value"])
-            if "is_playing" in payload:
-                return bool(payload["is_playing"])
-        return None
+        return _extract_is_playing(payload)
 
     def _best_track_match(self, tracks: list[dict[str, Any]], *, title: str, artist: str) -> dict[str, Any] | None:
-        return best_track_match(tracks, title=title, artist=artist)
-
-    def _best_artist_track_match(self, tracks: list[dict[str, Any]], *, artist: str) -> dict[str, Any] | None:
-        return best_artist_track_match(tracks, artist=artist, rng=self._random, pool_size=self.TRACK_SELECTION_POOL_SIZE)
+        return self._search_ctrl._best_track_match(tracks, title=title, artist=artist)
 
     def _best_playlist_match(self, playlists: list[dict[str, Any]], *, playlist_name: str) -> dict[str, Any] | None:
-        return best_playlist_match(playlists, playlist_name=playlist_name)
-
-    def _best_artist_track_matches(self, tracks: list[dict[str, Any]], *, artist: str, limit: int) -> list[dict[str, Any]]:
-        return best_artist_track_matches(tracks, artist=artist, limit=limit, rng=self._random, pool_size=self.TRACK_SELECTION_POOL_SIZE)
-
-    def _artist_track_score(self, track: dict[str, Any]) -> tuple[int, int]:
-        return artist_track_score(track)
+        return self._search_ctrl._best_playlist_match(playlists, playlist_name=playlist_name)
 
     def _top_pool_order(
         self,
@@ -1258,38 +645,7 @@ class CiderAgentService:
         take: int,
         pool_size: int | None = None,
     ) -> list[dict[str, Any]]:
-        return top_pool_order(tracks, take=take, rng=self._random, pool_size=pool_size, default_pool_size=self.TRACK_SELECTION_POOL_SIZE)
-
-    def _play_search_result_from_pool(self, *, query: str, source: str, storefront: str) -> dict[str, Any]:
-        resolved_source = source.strip().lower()
-        if resolved_source == "default":
-            resolved_source = self.default_search_source()
-        if resolved_source not in {"catalog", "library"}:
-            raise CiderValidationError("source must be one of: default, catalog, library.")
-        if resolved_source == "catalog":
-            results = self.search_catalog_tracks(query, limit=10, storefront=storefront)
-        else:
-            results = self.search_library_tracks(query, limit=10)
-        tracks = results["tracks"]
-        if not tracks:
-            raise CiderValidationError(f"No tracks found for query: {query}")
-        selected = self._top_pool_order(tracks, take=1)[0]
-        return self._play_flattened_track(selected, is_library_default=resolved_source == "library")
+        return self._search_ctrl._top_pool_order(tracks, take=take, pool_size=pool_size)
 
     def _play_flattened_track(self, track: dict[str, Any], *, is_library_default: bool) -> dict[str, Any]:
-        play_params = track.get("play_params", {})
-        item_id = str(play_params.get("id", "")).strip()
-        kind = str(play_params.get("kind", "songs")).strip() or "songs"
-        is_library = bool(play_params.get("is_library", is_library_default))
-        if not item_id:
-            raise CiderValidationError("Resolved track did not include a playable id.")
-        return self.play_item(item_id, kind=kind, is_library=is_library, track=track)
-
-    def _enqueue_flattened_track(self, track: dict[str, Any]) -> dict[str, Any]:
-        play_params = track.get("play_params", {})
-        item_id = str(play_params.get("id", "")).strip()
-        kind = str(play_params.get("kind", "songs")).strip() or "songs"
-        is_library = bool(play_params.get("is_library", False))
-        if not item_id:
-            raise CiderValidationError("Resolved track did not include a playable id.")
-        return self.play_later({"id": item_id, "type": kind, "isLibrary": is_library})
+        return self._search_ctrl._play_flattened_track(track, is_library_default=is_library_default)
