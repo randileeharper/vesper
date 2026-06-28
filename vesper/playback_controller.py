@@ -179,14 +179,17 @@ class PlaybackController:
         # Fan out the 7 playback reads on the reused instance pool rather than
         # creating a ThreadPoolExecutor per call. Each future's result() is
         # awaited below, so all submissions complete before we return. See #67.
-        # Futures are registered in _pending_futures so close() can drain them
-        # if it runs while this fan-out is in flight (issue #89).
-        futures = {
-            name: self._executor.submit(self._rpc.playback_get, path)
-            for name, path in snapshot_paths.items()
-        }
-        with self._pending_lock:
-            self._pending_futures.update(futures.values())
+        # Futures are registered in _pending_futures under the lock as they are
+        # submitted so close() can drain them if it runs while this fan-out is
+        # in flight (issue #89). Registering atomically with submission closes
+        # the window where a future has started running but isn't in the
+        # pending set yet.
+        futures: dict[str, Future[Any]] = {}
+        for name, path in snapshot_paths.items():
+            future = self._executor.submit(self._rpc.playback_get, path)
+            with self._pending_lock:
+                self._pending_futures.add(future)
+            futures[name] = future
         try:
             payloads = {name: future.result() for name, future in futures.items()}
         finally:

@@ -91,7 +91,6 @@ class CiderAgentService:
         self._playback_ctrl = PlaybackController(self, rpc=self._rpc, preferences=self._preferences, settings=self._settings)
         self._text_request_ctrl = TextRequestController(self)
         self._genre_cache = self._search_ctrl._genre_cache
-        self.reconcile_session_runtime()
 
     @property
     def _session_runtime(self) -> dict[int, dict[str, Any]]:

@@ -49,6 +49,11 @@ class Application:
         into their lifespans instead of calling the service start/stop methods
         directly, so the worker is never started twice or stopped too early.
         """
+        # Reconcile session runtime from storage before starting the worker.
+        # This was previously called in CiderAgentService.__init__ (issue #86);
+        # it is now an explicit startup side effect so construction stays cheap
+        # and deterministic.
+        self._service.reconcile_session_runtime()
         self._service.start_background_session_worker()
         try:
             yield
@@ -68,6 +73,11 @@ def service_context() -> Iterator[CiderAgentService]:
     a second CLI command in the same process) gets a fresh instance.
     """
     service = get_service()
+    # Reconcile session runtime from storage. This was previously called in
+    # CiderAgentService.__init__ (issue #86); it is now an explicit startup
+    # side effect so construction stays cheap and deterministic. CLI one-shot
+    # commands that touch session state need the runtime restored.
+    service.reconcile_session_runtime()
     try:
         yield service
     finally:

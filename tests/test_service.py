@@ -1674,18 +1674,25 @@ def test_playback_close_drains_in_flight_snapshot(service) -> None:
     ctrl = service._playback_ctrl
     rpc = service._rpc
 
-    # Gate that keeps the first RPC call blocked until we release it.
+    # Gate that blocks ALL RPC calls until released. We wait for all 7
+    # snapshot reads to start before signalling, then block every call on the
+    # gate. This ensures all 7 futures are submitted and in-flight when close()
+    # runs, regardless of pool scheduling order.
     gate = _threading.Event()
+    call_count = _threading.Lock()
     call_started = _threading.Event()
 
     original_get = rpc.playback_get
 
     def gated_playback_get(path: str):
-        if path == "/is-playing" and not gate.is_set():
-            call_started.set()
-            gate.wait(timeout=10)
+        with call_count:
+            rpc.playback_get_calls.append(path)
+            if len(rpc.playback_get_calls) >= 7 and not call_started.is_set():
+                call_started.set()
+        gate.wait(timeout=10)
         return original_get(path)
 
+    rpc.playback_get_calls.clear()
     rpc.playback_get = gated_playback_get
 
     # Start a snapshot in a background thread. It will block on the gate.
@@ -1972,6 +1979,7 @@ def test_paused_session_runtime_survives_restart(settings, service, tmp_path) ->
         preference_store=PreferenceStore(database_path),
         resolver=first._resolver,
     )
+    restarted.reconcile_session_runtime()
 
     session = restarted._preferences.get_active_session()
     assert session is not None
@@ -2021,6 +2029,7 @@ def test_reconcile_preserves_current_playing_queue_item(settings, service, tmp_p
         preference_store=PreferenceStore(database_path),
         resolver=first._resolver,
     )
+    restarted.reconcile_session_runtime()
 
     queue = restarted.session_queue(include_history=True)
     assert queue["items"][0]["state"] == "playing"
@@ -2071,6 +2080,7 @@ def test_active_stopped_session_remains_eligible_after_restart(settings, service
         preference_store=PreferenceStore(database_path),
         resolver=first._resolver,
     )
+    restarted.reconcile_session_runtime()
 
     session = restarted._preferences.get_active_session()
     assert session is not None
@@ -2121,6 +2131,7 @@ def test_explicit_play_advances_stopped_active_session_after_restart(settings, s
         preference_store=PreferenceStore(database_path),
         resolver=first._resolver,
     )
+    restarted.reconcile_session_runtime()
 
     session = restarted._preferences.get_active_session()
     assert session is not None
@@ -2164,8 +2175,66 @@ def test_reconcile_without_active_session_has_no_runtime(settings, service, tmp_
         resolver=service._resolver.__class__(),
     )
 
+    restarted.reconcile_session_runtime()
     assert restarted._preferences.get_active_session() is None
     assert restarted._session_runtime == {}
+
+
+def test_construction_has_no_storage_or_rpc_side_effects(settings, service, tmp_path) -> None:
+    # CiderAgentService.__init__ must be cheap and deterministic: it should
+    # not hit SQLite for active-session lookup or call Cider RPC via
+    # playback_snapshot() during construction. Previously __init__ called
+    # reconcile_session_runtime() unconditionally (issue #86).
+    from vesper.storage import PreferenceStore
+
+    database_path = tmp_path / "side-effects.db"
+    rpc = service._rpc.__class__()
+    # Pre-seed an active session so reconcile would have side effects if it
+    # were still called in __init__.
+    store = PreferenceStore(database_path)
+    store.start_session(request_text="play upbeat music")
+
+    rpc.playback_get_calls.clear()
+
+    svc = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    try:
+        # No playback RPC calls should have been made during construction.
+        assert rpc.playback_get_calls == []
+        # Session runtime should be empty until reconcile is called explicitly.
+        session = svc._preferences.get_active_session()
+        assert session is not None
+        assert svc._session_runtime == {}
+        # Reconcile restores the runtime.
+        svc.reconcile_session_runtime()
+        assert session["id"] in svc._session_runtime
+    finally:
+        svc._playback_ctrl.close()
 
 
 def test_session_events_distinguish_rejection_steering_skip_and_auto_advance(service) -> None:
