@@ -18,6 +18,7 @@ The project is built around one principle: keep the main conversational agent le
 ## Requirements
 
 - Python 3.12+
+- uv (install: `curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Cider running locally
 - Cider external application access enabled
 - a Cider API token if your Cider build requires one
@@ -25,9 +26,7 @@ The project is built around one principle: keep the main conversational agent le
 ## Install
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .[dev]
+uv sync --extra dev
 cp config.example.json config.json
 ```
 
