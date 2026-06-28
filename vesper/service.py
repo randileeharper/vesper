@@ -5,9 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from functools import wraps
 import logging
-import json
 import random
-import threading
 from typing import Any
 
 from .config import Settings
@@ -19,7 +17,6 @@ from .historian import (
     current_operation,
     operation_context,
 )
-from .errors import CiderValidationError
 from .results import EngineActionResult, TextRequestResult
 from .resolver import (
     ResolvedAction,
@@ -29,7 +26,6 @@ from .resolver import (
 )
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore, close_connections
-from .matching import artist_track_score
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
@@ -41,6 +37,7 @@ from .preference_controller import PreferenceController
 from .search_controller import SearchController
 from .playback_controller import PlaybackController
 from .text_request_controller import TextRequestController
+from .resolver_debug import ResolverDebugLogger
 
 
 LOGGER = logging.getLogger(__name__)
@@ -87,8 +84,7 @@ class CiderAgentService:
             set_failure_callback(self._record_rpc_failure)
         self._preferences = preference_store or PreferenceStore(settings.database_path)
         self._resolver = resolver or build_resolver(settings)
-        self._resolver_debug_log_lock = threading.Lock()
-        self._resolver_debug_episode_depth = 0
+        self._resolver_debug = ResolverDebugLogger(self)
         self._random = random.SystemRandom()
         # The adaptive-session engine owns the session runtime, the background
         # refill worker, and the search/planning/pool machinery.
@@ -669,24 +665,10 @@ class CiderAgentService:
         self._session._ensure_session_query_pools(session, search_sources)
 
     def _begin_resolver_debug_episode(self, reason: str) -> bool:
-        path = self.resolver_debug_log_path()
-        if path is None:
-            return False
-        with self._resolver_debug_log_lock:
-            if self._resolver_debug_episode_depth == 0:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    f"timestamp: {self.current_timestamp()}\nreason: {reason}\n\n",
-                    encoding="utf-8",
-                )
-            self._resolver_debug_episode_depth += 1
-            return True
+        return self._resolver_debug.begin_episode(reason)
 
     def _end_resolver_debug_episode(self, started: bool) -> None:
-        if not started:
-            return
-        with self._resolver_debug_log_lock:
-            self._resolver_debug_episode_depth = max(0, self._resolver_debug_episode_depth - 1)
+        self._resolver_debug.end_episode(started)
 
     def append_resolver_debug_log(
         self,
@@ -696,42 +678,15 @@ class CiderAgentService:
         response_body: dict[str, Any],
         response_content: str,
     ) -> None:
-        path = self.resolver_debug_log_path()
-        if path is None:
-            return
-        entry = (
-            f"=== {stage} ===\n"
-            f"timestamp: {self.current_timestamp()}\n"
-            "messages:\n"
-            f"{json.dumps(messages, ensure_ascii=False, indent=2)}\n\n"
-            "response_body:\n"
-            f"{json.dumps(response_body, ensure_ascii=False, indent=2)}\n\n"
-            "response_content:\n"
-            f"{response_content}\n\n"
+        self._resolver_debug.append_resolver_log(
+            stage=stage,
+            messages=messages,
+            response_body=response_body,
+            response_content=response_content,
         )
-        with self._resolver_debug_log_lock:
-            if self._resolver_debug_episode_depth <= 0:
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(entry)
 
     def append_session_debug_log(self, *, stage: str, payload: dict[str, Any]) -> None:
-        path = self.resolver_debug_log_path()
-        if path is None:
-            return
-        entry = (
-            f"=== {stage} ===\n"
-            f"timestamp: {self.current_timestamp()}\n"
-            "payload:\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        )
-        with self._resolver_debug_log_lock:
-            if self._resolver_debug_episode_depth <= 0:
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(entry)
+        self._resolver_debug.append_session_log(stage=stage, payload=payload)
 
     def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
         return self._session._should_advance_session(session, playback)
@@ -748,17 +703,8 @@ class CiderAgentService:
     def _best_track_match(self, tracks: list[dict[str, Any]], *, title: str, artist: str) -> dict[str, Any] | None:
         return self._search_ctrl._best_track_match(tracks, title=title, artist=artist)
 
-    def _best_artist_track_match(self, tracks: list[dict[str, Any]], *, artist: str) -> dict[str, Any] | None:
-        return self._search_ctrl._best_artist_track_match(tracks, artist=artist)
-
     def _best_playlist_match(self, playlists: list[dict[str, Any]], *, playlist_name: str) -> dict[str, Any] | None:
         return self._search_ctrl._best_playlist_match(playlists, playlist_name=playlist_name)
-
-    def _best_artist_track_matches(self, tracks: list[dict[str, Any]], *, artist: str, limit: int) -> list[dict[str, Any]]:
-        return self._search_ctrl._best_artist_track_matches(tracks, artist=artist, limit=limit)
-
-    def _artist_track_score(self, track: dict[str, Any]) -> tuple[int, int]:
-        return artist_track_score(track)
 
     def _top_pool_order(
         self,
@@ -769,17 +715,5 @@ class CiderAgentService:
     ) -> list[dict[str, Any]]:
         return self._search_ctrl._top_pool_order(tracks, take=take, pool_size=pool_size)
 
-    def _play_search_result_from_pool(self, *, query: str, source: str, storefront: str) -> dict[str, Any]:
-        return self._search_ctrl._play_search_result_from_pool(query=query, source=source, storefront=storefront)
-
     def _play_flattened_track(self, track: dict[str, Any], *, is_library_default: bool) -> dict[str, Any]:
         return self._search_ctrl._play_flattened_track(track, is_library_default=is_library_default)
-
-    def _enqueue_flattened_track(self, track: dict[str, Any]) -> dict[str, Any]:
-        play_params = track.get("play_params", {})
-        item_id = str(play_params.get("id", "")).strip()
-        kind = str(play_params.get("kind", "songs")).strip() or "songs"
-        is_library = bool(play_params.get("is_library", False))
-        if not item_id:
-            raise CiderValidationError("Resolved track did not include a playable id.")
-        return self.play_later({"id": item_id, "type": kind, "isLibrary": is_library})
