@@ -24,9 +24,14 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: dist
-          path: dist/*   # retained for debugging; the GitHub Release is the primary delivery
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          # retained for debugging; the GitHub Release is the primary delivery
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
           generate_release_notes: true
