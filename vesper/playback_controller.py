@@ -102,9 +102,11 @@ class PlaybackController:
         any in-flight playback_snapshot() fan-out to finish so worker threads
         are not orphaned and can't raise at interpreter shutdown (issue #89).
         """
-        # Stop accepting new submissions first. cancel_futures=True (3.9+)
-        # drops not-yet-started tasks; started ones still run to completion.
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        # Stop accepting new submissions. Do NOT use cancel_futures=True here:
+        # playback_snapshot() is actively awaiting future.result() on the same
+        # futures, and cancelling them would raise CancelledError inside the
+        # snapshot call. The drain loop below handles waiting.
+        self._executor.shutdown(wait=False)
         with self._pending_lock:
             pending = list(self._pending_futures)
         # Drain in-flight tasks with a short bounded timeout per future. If a
