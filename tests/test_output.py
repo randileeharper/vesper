@@ -346,3 +346,48 @@ def test_looks_like_guards():
     assert looks_like_session_execution({"mode": "radio", "session": {}, "result": {}}) is True
     assert looks_like_session_status({"session": {}, "recent_tracks": []}) is True
     assert looks_like_play_candidate_result({"selection_strategy": "x", "selected_track": {}}) is True
+
+
+# --- dispatch ordering -----------------------------------------------------
+
+
+def test_compact_output_compacts_music_preference_before_track():
+    # A liked-track preference carries ``title`` + ``artist_name``, which would
+    # also match ``looks_like_track`` if the preference predicate did not win.
+    # Pin that preference compaction takes precedence.
+    value = {"preference_type": "liked_track", "title": "T", "artist_name": "A", "track_id": "x"}
+    assert compact_output(value, TIMING_OFF) == {"title": "T", "artist_name": "A"}
+
+
+def test_compact_output_compacts_session_envelope_before_track():
+    # A session-execution envelope contains a nested track-shaped ``result``
+    # and itself is not a track; the envelope predicate must win so the whole
+    # envelope is compacted rather than the top-level dict being miscompacted as
+    # a bare track.
+    value = {
+        "status": "ok",
+        "mode": "radio",
+        "session": {"id": "s1", "is_active": True},
+        "result": {"status": "ok", "selection_strategy": "seeded", "enqueued_count": 1, "tracks": [{"title": "T", "artist": "A"}]},
+    }
+    compacted = compact_output(value, TIMING_OFF)
+    assert compacted["result"] == {"status": "ok", "selection_strategy": "seeded", "enqueued_count": 1, "primary_track": {"title": "T", "artist": "A"}}
+
+
+def test_compact_output_generic_dict_falls_through_to_keywise_path():
+    # A dict matching no shape guard falls through to the generic key-wise path,
+    # which recursively compacts values but preserves scalar keys as-is.
+    value = {"count": 3, "query": "q", "ok": True}
+    assert compact_output(value, TIMING_OFF) == {"count": 3, "query": "q", "ok": True}
+
+
+def test_summarize_execution_falls_through_when_handler_returns_none():
+    # ``get_now_playing`` with no track data returns None from its handler and
+    # must fall through to the default ``action`` rather than crash or coerce.
+    assert summarize_execution({"action": "get_now_playing", "result": {}}) == "get_now_playing"
+    assert summarize_execution({"action": "list_library_playlists", "result": {}}) == "list_library_playlists"
+
+
+def test_summarize_execution_non_dict_result_falls_back_to_action():
+    assert summarize_execution({"action": "play", "result": ["not", "a", "dict"]}) == "play"
+    assert summarize_execution({"action": "", "result": "x"}) == "completed"
