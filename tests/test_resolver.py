@@ -154,6 +154,57 @@ def test_openai_compatible_resolver_stops_after_five_bad_attempts(settings: Sett
     assert call_count == 5
 
 
+def test_openai_compatible_resolver_preserves_all_attempt_errors(settings: Settings, service) -> None:
+    # When earlier attempts fail differently from the final attempt (e.g. HTTP
+    # 500s before a JSON parse error), the surfaced error should name every
+    # attempt's failure rather than only the last one. See #70.
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    call_count = 0
+
+    class MixedFailureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            # First two attempts: HTTP 500. Remaining attempts: 200 with
+            # unparseable content, so the final failure is a JSON parse error.
+            if call_count <= 2:
+                return httpx.Response(500, json={"error": "model overloaded"})
+            body = {"choices": [{"message": {"content": "nonsense with no json anywhere"}}]}
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=MixedFailureTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    with pytest.raises(ResolverError) as exc_info:
+        resolver.resolve("what's playing?", service)
+
+    message = str(exc_info.value)
+    # Every attempt's failure is reported, not just the last one.
+    assert "attempt 1:" in message and "attempt 5:" in message
+    assert "HTTP 500" in message
+    assert "attempt 5: Resolver output did not contain a JSON object." in message
+    assert call_count == 5
+
+
 def test_openai_compatible_resolver_sends_no_think_ollama_fields(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
