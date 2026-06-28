@@ -18,7 +18,7 @@ vesper.cli              vesper.a2a                 vesper.mcp_server
        +-------------------+-------------------+------------------+
        |                   |                   |                  |
  CiderRpcClient      PreferenceStore       Resolver        SessionEngine
-   (rpc.py)           (storage.py)       (resolver.py)     (session.py)
+   (rpc.py)           (storage/)       (resolver.py)     (session.py)
        |                   |                   |                  |
      Cider              SQLite       fallback/OpenAI-      adaptive session
                                   compatible decisions    runtime + worker
@@ -113,7 +113,7 @@ See [Adaptive Sessions, Search, and Preferences](adaptive-sessions.md) for the p
 
 ## Persistence
 
-`vesper/storage.py` implements `PreferenceStore`, a SQLite store for:
+The `vesper.storage` package implements `PreferenceStore`, a SQLite store for:
 
 - legacy generic preferences
 - music preferences such as liked tracks, favored artists, and rejected tracks

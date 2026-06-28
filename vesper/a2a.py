@@ -37,6 +37,7 @@ from a2a.types import (
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, PROTOCOL_VERSION_1_0, TransportProtocol
 from a2a.utils.errors import InternalError, InvalidParamsError
 
+from . import __version__
 from .action_registry import is_public_action
 from .app import Application, get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
@@ -115,7 +116,7 @@ def build_agent_card() -> AgentCard:
     return AgentCard(
         name="vesper",
         description="A dedicated music control agent for Cider. The intended interface is plain-language requests over A2A text messages.",
-        version="0.1.0",
+        version=__version__,
         supported_interfaces=[
             AgentInterface(
                 url=f"{settings.public_base_url}/a2a",

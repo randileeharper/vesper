@@ -62,7 +62,7 @@ vesper/
   rpc.py               # Cider boundary
   service.py           # transport-neutral domain facade
   session.py           # adaptive-session engine and worker
-  storage.py           # SQLite preferences and session persistence
+  storage/             # SQLite preferences and session persistence
   validation.py        # argument validation/coercion helpers
 
 tests/
@@ -79,7 +79,7 @@ tests/
 - **New MCP tool**: add it in `mcp_server.py` only if it should be a direct tool. Otherwise prefer routing through `ask(text)`.
 - **Resolver prompt or parsing changes**: update `resolver.py` and tests. Keep the resolver constrained to known actions, short query plans, or candidate selection.
 - **Adaptive-session behavior**: change `session.py`. Use the `SessionHost` protocol for cross-cutting service capabilities instead of importing the concrete service class.
-- **Persistence changes**: update `storage.py` initialization/migration behavior and add tests that cover existing database compatibility when possible.
+- **Persistence changes**: update `vesper.storage` initialization/migration behavior and add tests that cover existing database compatibility when possible.
 - **Configuration changes**: update `Settings` in `config.py`, `config.example.json`, this documentation, and config tests.
 
 ## Design Rules
