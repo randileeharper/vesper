@@ -15,7 +15,7 @@ import logging
 from typing import Any
 
 from .errors import CiderRpcError
-from .rpc import CiderRpcClient
+from .rpc import CiderRpcClient, _sanitize_storefront
 
 LOGGER = logging.getLogger(__name__)
 
@@ -148,6 +148,7 @@ def catalog_resource_search(
 ) -> list[dict[str, Any]]:
     from urllib.parse import quote
 
+    storefront = _sanitize_storefront(storefront)
     path = (
         f"/v1/catalog/{storefront}/search?term={quote(query, safe='')}"
         f"&types={resource_type}&limit={limit}"
@@ -165,6 +166,7 @@ def catalog_relationship_tracks(
     page_limit: int,
     storefront: str = SESSION_STOREFRONT,
 ) -> list[dict[str, Any]]:
+    storefront = _sanitize_storefront(storefront)
     tracks: list[dict[str, Any]] = []
     offset = 0
     while len(tracks) < result_limit:
@@ -199,6 +201,7 @@ def load_genre_map(
     genre_cache: dict[str, dict[str, str]],
     storefront: str = SESSION_STOREFRONT,
 ) -> dict[str, str]:
+    storefront = _sanitize_storefront(storefront)
     if storefront in genre_cache:
         return dict(genre_cache[storefront])
     try:
