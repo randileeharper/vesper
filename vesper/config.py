@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     global_recent_tracks_limit: int = Field(default=10, ge=1, le=500)
     request_timeout_seconds: float = Field(default=60.0, gt=0)
     verify_tls: bool = True
+    cider_retry_count: int = Field(default=2, ge=0)
     log_level: str = "INFO"
     historian_enabled: bool = False
     historian_base_url: str = "http://127.0.0.1:8768"
@@ -262,6 +263,7 @@ class Settings(BaseSettings):
             "global_recent_tracks_limit": self.global_recent_tracks_limit,
             "request_timeout_seconds": self.request_timeout_seconds,
             "verify_tls": self.verify_tls,
+            "cider_retry_count": self.cider_retry_count,
             "log_level": self.log_level,
             "historian_enabled": self.historian_enabled,
             "historian_base_url": self.historian_base_url,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -27,6 +28,20 @@ def _sanitize_storefront(storefront: str) -> str:
     return "us"
 
 
+class _TransientRequestError(Exception):
+    """Internal signal for a retriable Cider RPC failure.
+
+    Carries the same ``status_code``/``detail`` shape as :class:`CiderRpcError`
+    so the final error surfaced after retries are exhausted is identical to the
+    single-attempt failure that produced it.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+
 class CiderRpcClient:
     """HTTP client wrapper around Cider's local RPC API."""
 
@@ -35,9 +50,11 @@ class CiderRpcClient:
         settings: Settings,
         session: httpx.Client | None = None,
         failure_callback: Callable[[dict[str, Any]], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._settings = settings
         self._failure_callback = failure_callback
+        self._sleep = sleep
         self._session = session or httpx.Client(
             base_url=settings.cider_base_url,
             timeout=settings.request_timeout_seconds,
@@ -85,6 +102,42 @@ class CiderRpcClient:
         return self.run_amapi_v3(f"/v1/me/library/search?term={encoded_query}&types={encoded_types}&limit={limit}")
 
     def _request(self, method: str, path: str, json_body: dict[str, Any] | None = None) -> Any:
+        # Only safe, idempotent reads are retried. Cider playback POSTs
+        # (play, next, volume, queue) are stateful and not idempotent, so a
+        # retry could duplicate a side effect. ``run_amapi_v3`` issues POSTs
+        # too (including catalog/library searches); those are also skipped to
+        # stay conservative -- they are not known to be idempotent.
+        retryable = method == "GET"
+        retry_count = self._settings.cider_retry_count if retryable else 0
+
+        last_error: _TransientRequestError | None = None
+        for attempt in range(retry_count + 1):
+            try:
+                return self._send_once(method, path, json_body)
+            except _TransientRequestError as exc:
+                last_error = exc
+                if attempt < retry_count:
+                    self._sleep(0.1 * (2**attempt))
+                    continue
+                break
+
+        # Retries exhausted: report once and surface the final failure.
+        assert last_error is not None
+        self._report_failure(method, path, last_error.status_code, str(last_error))
+        raise CiderRpcError(
+            str(last_error),
+            status_code=last_error.status_code,
+            detail=last_error.detail,
+        ) from last_error
+
+    def _send_once(self, method: str, path: str, json_body: dict[str, Any] | None) -> Any:
+        """Perform a single Cider RPC attempt.
+
+        Raises :class:`_TransientRequestError` for retriable failures
+        (connection errors and 5xx responses) so :meth:`_request` can decide
+        whether to retry. All other errors (4xx, non-JSON, etc.) raise
+        :class:`CiderRpcError` immediately and are not retried.
+        """
         headers: dict[str, str] = {}
         if self._settings.cider_api_token:
             headers["apptoken"] = self._settings.cider_api_token
@@ -92,8 +145,12 @@ class CiderRpcClient:
         try:
             response = self._session.request(method, path, headers=headers, json=json_body)
         except httpx.HTTPError as exc:
-            self._report_failure(method, path, None, str(exc))
-            raise CiderRpcError(f"Could not reach Cider RPC at {self._settings.cider_base_url}: {exc}") from exc
+            # Connection-level failure (Cider down, network hiccup). Retried
+            # by the caller for safe reads; surfaces as a connection error
+            # otherwise.
+            raise _TransientRequestError(
+                f"Could not reach Cider RPC at {self._settings.cider_base_url}: {exc}"
+            ) from exc
 
         if response.status_code == 204:
             return None
@@ -107,7 +164,19 @@ class CiderRpcClient:
             detail = None
             if isinstance(payload, dict):
                 detail = payload.get("detail") or payload.get("message") or payload.get("error")
-            self._report_failure(method, path, response.status_code, str(detail or "HTTP error"))
+            message = str(detail or "HTTP error")
+            if 500 <= response.status_code < 600:
+                # Server errors are transient -- the request may have failed
+                # for an ephemeral reason and a retry is safe for idempotent
+                # reads.
+                raise _TransientRequestError(
+                    f"Cider RPC returned HTTP {response.status_code} for {method} {path}.",
+                    status_code=response.status_code,
+                    detail=detail,
+                )
+            # Client errors (4xx) are definitive: retrying would not help and
+            # could mask a genuine bad request. Report and raise immediately.
+            self._report_failure(method, path, response.status_code, message)
             raise CiderRpcError(
                 f"Cider RPC returned HTTP {response.status_code} for {method} {path}.",
                 status_code=response.status_code,
